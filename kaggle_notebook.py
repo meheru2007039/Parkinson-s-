@@ -21,7 +21,7 @@ from sklearn.metrics import roc_curve, auc
 # ============================================================================
 # config
 # ============================================================================
-def config():
+def get_config():
     config = {
         'data_root': "/kaggle/input/parkinsons/pads-parkinsons-disease-smartwatch-dataset-1.0.0",
         'apply_downsampling': True,
@@ -437,16 +437,18 @@ import math
 from transformers import BertTokenizer, BertModel
 
 class TextTokenizer(nn.Module):
-    
+
     def __init__(self, model_name='bert-base-uncased', output_dim=128, dropout=0.1):
         super().__init__()
-        
-        self.model_name = model_name
+
+        # Load tokenizer ONCE in __init__ instead of every forward pass
+        self.tokenizer = BertTokenizer.from_pretrained(model_name)
         self.bert = BertModel.from_pretrained(model_name)
-        
+
+        # Freeze BERT parameters - we're using it as a feature extractor
         for param in self.bert.parameters():
             param.requires_grad = False
-            
+
         input_dim = self.bert.config.hidden_size
 
         self.projection = nn.Sequential(
@@ -455,22 +457,21 @@ class TextTokenizer(nn.Module):
             nn.Dropout(dropout),
             nn.LayerNorm(output_dim)
         )
-        
+
     def forward(self, text_list, device):
-        tokenizer = BertTokenizer.from_pretrained(self.model_name)
-        tokens = tokenizer(text_list, padding=True, truncation=True, max_length=512, return_tensors="pt")
-        
+        # Use the pre-loaded tokenizer
+        tokens = self.tokenizer(text_list, padding=True, truncation=True,
+                               max_length=512, return_tensors="pt")
+
         input_ids = tokens['input_ids'].to(device)
         attention_mask = tokens['attention_mask'].to(device)
 
-        if self.training:
+        # Always use no_grad since BERT is frozen
+        with torch.no_grad():
             outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        else:
-            with torch.no_grad():
-                outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        
+
         output = outputs.pooler_output
-        
+
         return self.projection(output)
 
 class PositionalEncoding(nn.Module):
@@ -1346,10 +1347,10 @@ def train_model(config):
     return all_fold_results
 
 def main():
-    config = config()
-    
+    config = get_config()
+
     results = train_model(config)
-    
+
     return results
 
 
