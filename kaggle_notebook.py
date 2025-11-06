@@ -141,19 +141,20 @@ class ParkinsonsDatasetLoader(Dataset):
 
                 condition = metadata.get('condition', '')
 
-                # Determine labels and overlap (differential sampling for class imbalance)
+                # Determine labels
+                # UNIFORM overlap to prevent num_windows leakage
+                # Different overlaps create different window counts which leak labels!
+                overlap = 0.5
+
                 if condition == 'Healthy':
                     hc_vs_pd_label = 0
                     pd_vs_dd_label = -1
-                    overlap = 0.70
                 elif 'Parkinson' in condition:
                     hc_vs_pd_label = 1
                     pd_vs_dd_label = 0
-                    overlap = 0
                 else:
                     hc_vs_pd_label = -1
                     pd_vs_dd_label = 1
-                    overlap = 0.65
                 
                 # Process each task separately
                 for task in self.tasks:
@@ -854,14 +855,15 @@ def plot_tsne(features, hc_pd_labels, pd_dd_labels, output_dir="plots"):
 # Trainer
 # ============================================================================
 
-def training_phase(model, dataloader, criterion, optimizer, device, gradient_accumulation_steps=1):
+def training_phase(model, dataloader, criterion_hc, criterion_pd, optimizer, device, gradient_accumulation_steps=1):
     """
     Training phase for one epoch with gradient accumulation.
 
     Args:
         model: The model to train
         dataloader: Training data loader
-        criterion: Loss function
+        criterion_hc: Loss function for HC vs PD task
+        criterion_pd: Loss function for PD vs DD task
         optimizer: Optimizer
         device: Device to train on
         gradient_accumulation_steps: Number of steps to accumulate gradients before updating
@@ -891,14 +893,14 @@ def training_phase(model, dataloader, criterion, optimizer, device, gradient_acc
         valid_hc_mask = batch['hc_vs_pd'] != -1
         loss_hc = 0
         if valid_hc_mask.sum() > 0:
-            loss_hc = criterion(logits_hc_vs_pd[valid_hc_mask],
+            loss_hc = criterion_hc(logits_hc_vs_pd[valid_hc_mask],
                                batch['hc_vs_pd'][valid_hc_mask])
 
         # Calculate loss for PD vs DD (exclude -1 labels)
         valid_pd_mask = batch['pd_vs_dd'] != -1
         loss_pd = 0
         if valid_pd_mask.sum() > 0:
-            loss_pd = criterion(logits_pd_vs_dd[valid_pd_mask],
+            loss_pd = criterion_pd(logits_pd_vs_dd[valid_pd_mask],
                                batch['pd_vs_dd'][valid_pd_mask])
 
         # Combined loss
@@ -938,7 +940,7 @@ def training_phase(model, dataloader, criterion, optimizer, device, gradient_acc
     avg_loss = total_loss / num_batches if num_batches > 0 else 0
     return avg_loss 
 
-def validation_phase(model, dataloader, criterion, device, debug_patient_ids=False):
+def validation_phase(model, dataloader, criterion_hc, criterion_pd, device, debug_patient_ids=False):
     """
     Validation phase.
     Returns validation loss and metrics for both tasks.
@@ -1001,13 +1003,13 @@ def validation_phase(model, dataloader, criterion, device, debug_patient_ids=Fal
             valid_hc_mask = batch['hc_vs_pd'] != -1
             loss_hc = 0
             if valid_hc_mask.sum() > 0:
-                loss_hc = criterion(logits_hc_vs_pd[valid_hc_mask],
+                loss_hc = criterion_hc(logits_hc_vs_pd[valid_hc_mask],
                                    batch['hc_vs_pd'][valid_hc_mask])
 
             valid_pd_mask = batch['pd_vs_dd'] != -1
             loss_pd = 0
             if valid_pd_mask.sum() > 0:
-                loss_pd = criterion(logits_pd_vs_dd[valid_pd_mask],
+                loss_pd = criterion_pd(logits_pd_vs_dd[valid_pd_mask],
                                    batch['pd_vs_dd'][valid_pd_mask])
 
             loss = loss_hc + loss_pd
@@ -1149,7 +1151,33 @@ def train_model(config):
             seq_len=config['seq_len']
         ).to(device)
 
-        criterion = nn.CrossEntropyLoss()
+        # Compute class weights for handling imbalance (better than differential sampling)
+        # Count labels in training data
+        train_hc_count = sum(1 for pt in train_dataset.patient_task_data if pt['hc_vs_pd'] == 0)
+        train_pd_count = sum(1 for pt in train_dataset.patient_task_data if pt['hc_vs_pd'] == 1)
+        train_dd_count = sum(1 for pt in train_dataset.patient_task_data if pt['pd_vs_dd'] == 1)
+
+        # Calculate inverse frequency weights
+        total_hc_pd = train_hc_count + train_pd_count
+        total_pd_dd = train_pd_count + train_dd_count
+
+        weight_hc_pd = torch.FloatTensor([
+            total_hc_pd / (2 * train_hc_count),
+            total_hc_pd / (2 * train_pd_count)
+        ]).to(device)
+
+        weight_pd_dd = torch.FloatTensor([
+            total_pd_dd / (2 * train_pd_count),
+            total_pd_dd / (2 * train_dd_count)
+        ]).to(device)
+
+        print(f"\n[Class Weighting] HC vs PD weights: HC={weight_hc_pd[0]:.3f}, PD={weight_hc_pd[1]:.3f}")
+        print(f"[Class Weighting] PD vs DD weights: PD={weight_pd_dd[0]:.3f}, DD={weight_pd_dd[1]:.3f}")
+
+        # Use weighted loss instead of differential sampling
+        criterion_hc = nn.CrossEntropyLoss(weight=weight_hc_pd)
+        criterion_pd = nn.CrossEntropyLoss(weight=weight_pd_dd)
+
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=config['learning_rate'],
@@ -1201,13 +1229,13 @@ def train_model(config):
 
             # Training phase
             train_loss = training_phase(
-                model, train_loader, criterion, optimizer, device,
+                model, train_loader, criterion_hc, criterion_pd, optimizer, device,
                 gradient_accumulation_steps=config['gradient_accumulation_steps']
             )
 
             # Validation phase (debug patient IDs on first epoch)
             val_loss, val_metrics_hc, val_metrics_pd, features, hc_labels, pd_labels, val_patient_ids = validation_phase(
-                model, val_loader, criterion, device, debug_patient_ids=(epoch == 0)
+                model, val_loader, criterion_hc, criterion_pd, device, debug_patient_ids=(epoch == 0)
             )
 
             # ============ CHECK FOR DATA LEAKAGE ON FIRST EPOCH ============
