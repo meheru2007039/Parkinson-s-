@@ -1117,6 +1117,17 @@ def validation_phase(model, dataloader, criterion, device, debug_patient_ids=Fal
             logits_hc_vs_pd, logits_pd_vs_dd = model(batch)
 
             # Track patient IDs for debugging
+            if debug_patient_ids and num_batches == 0:  # First batch only
+                print("\n" + "="*60)
+                print("VALIDATION BATCH STRUCTURE:")
+                print("="*60)
+                print(f"Batch keys: {list(batch.keys())}")
+                print(f"'patient_ids' in batch: {'patient_ids' in batch}")
+                if 'patient_ids' in batch:
+                    print(f"Type of patient_ids: {type(batch['patient_ids'])}")
+                    print(f"First 5 patient IDs: {batch['patient_ids'][:5]}")
+                print("="*60)
+
             if 'patient_ids' in batch:
                 val_patient_ids.update(batch['patient_ids'])
 
@@ -1148,6 +1159,17 @@ def validation_phase(model, dataloader, criterion, device, debug_patient_ids=Fal
             if valid_hc_mask.sum() > 0:
                 probs_hc = torch.softmax(logits_hc_vs_pd, dim=1)
                 preds_hc = torch.argmax(logits_hc_vs_pd, dim=1)
+
+                # Debug: Print first batch predictions
+                if debug_patient_ids and num_batches == 1:
+                    print("\n" + "="*60)
+                    print("FIRST BATCH PREDICTIONS (HC vs PD):")
+                    print("="*60)
+                    print(f"Logits (first 5):\n{logits_hc_vs_pd[valid_hc_mask][:5].cpu().numpy()}")
+                    print(f"\nTrue Labels (first 10): {batch['hc_vs_pd'][valid_hc_mask][:10].cpu().numpy()}")
+                    print(f"Predictions (first 10): {preds_hc[valid_hc_mask][:10].cpu().numpy()}")
+                    print(f"\nProbabilities for class 1 (first 5): {probs_hc[valid_hc_mask][:5, 1].cpu().numpy()}")
+                    print("="*60)
 
                 all_labels_hc.extend(batch['hc_vs_pd'][valid_hc_mask].cpu().numpy())
                 all_preds_hc.extend(preds_hc[valid_hc_mask].cpu().numpy())
@@ -1192,8 +1214,15 @@ def validation_phase(model, dataloader, criterion, device, debug_patient_ids=Fal
 
     # Debug patient IDs
     if debug_patient_ids:
-        print(f"\n[DEBUG] Validation set has {len(val_patient_ids)} unique patients")
-        print(f"[DEBUG] Sample patient IDs: {sorted(list(val_patient_ids))[:10]}")
+        print("\n" + "="*60)
+        print("VALIDATION SET PATIENT IDs:")
+        print("="*60)
+        print(f"Total unique patients in validation: {len(val_patient_ids)}")
+        if len(val_patient_ids) > 0:
+            print(f"Sample patient IDs: {sorted(list(val_patient_ids))[:10]}")
+        else:
+            print("[ERROR] No patient IDs collected from validation set!")
+        print("="*60)
 
     return avg_loss, metrics_hc, metrics_pd, all_features, all_hc_pd_labels_viz, all_pd_dd_labels_viz, val_patient_ids
 
@@ -1271,12 +1300,28 @@ def train_model(config):
         )
 
         # ============ COLLECT TRAIN PATIENT IDS FOR DEBUGGING ============
+        print("\n" + "="*60)
+        print("COLLECTING TRAIN PATIENT IDs FOR DEBUGGING...")
+        print("="*60)
         train_patient_ids = set()
+        batch_count = 0
         for batch in train_loader:
+            if batch_count == 0:  # First batch debug
+                print(f"[DEBUG] First TRAIN batch keys: {list(batch.keys())}")
+                print(f"[DEBUG] 'patient_ids' in batch: {'patient_ids' in batch}")
+                if 'patient_ids' in batch:
+                    print(f"[DEBUG] Type of patient_ids: {type(batch['patient_ids'])}")
+                    print(f"[DEBUG] First 5 patient IDs: {batch['patient_ids'][:5]}")
             if 'patient_ids' in batch:
                 train_patient_ids.update(batch['patient_ids'])
-        print(f"\n[DEBUG] Training set has {len(train_patient_ids)} unique patients")
-        print(f"[DEBUG] Sample train patient IDs: {sorted(list(train_patient_ids))[:10]}")
+            batch_count += 1
+
+        print(f"\n[RESULT] Training set has {len(train_patient_ids)} unique patients")
+        if len(train_patient_ids) > 0:
+            print(f"[RESULT] Sample train patient IDs: {sorted(list(train_patient_ids))[:10]}")
+        else:
+            print(f"[ERROR] No patient IDs collected from training set!")
+        print("="*60 + "\n")
         # ==================================================================
 
         # Track best model for this fold
@@ -1310,14 +1355,65 @@ def train_model(config):
 
             # ============ CHECK FOR DATA LEAKAGE ON FIRST EPOCH ============
             if epoch == 0:
+                print("\n" + "="*70)
+                print("DATA LEAKAGE CHECK - COMPARING TRAIN AND VALIDATION PATIENTS")
+                print("="*70)
+
                 overlap = train_patient_ids.intersection(val_patient_ids)
+
+                print(f"Train patients: {len(train_patient_ids)}")
+                print(f"Validation patients: {len(val_patient_ids)}")
+                print(f"Overlapping patients: {len(overlap)}")
+
                 if overlap:
-                    print(f"\n🚨 CRITICAL: DATA LEAKAGE DETECTED IN FOLD {fold_idx+1}!")
+                    print(f"\n🚨🚨🚨 CRITICAL: DATA LEAKAGE DETECTED! 🚨🚨🚨")
                     print(f"   {len(overlap)} patients appear in BOTH train and validation!")
                     print(f"   Overlapping IDs: {sorted(list(overlap))[:20]}")
-                    print(f"   This explains 100% accuracy - MODEL IS CHEATING!\n")
+                    print(f"   This EXPLAINS the 100% accuracy - MODEL IS CHEATING!")
+                    print(f"🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨")
                 else:
-                    print(f"\n✓ No train/val patient overlap in fold {fold_idx+1}")
+                    print(f"\n✓✓✓ GOOD NEWS: No train/val patient overlap detected!")
+
+                    # Check for subtle leakage via num_windows
+                    print(f"\n🔍 Checking for num_windows leakage...")
+                    # Collect num_windows statistics from validation loader
+                    num_windows_by_label_hc = {0: [], 1: []}
+                    num_windows_by_label_pd = {0: [], 1: []}
+
+                    for batch in val_loader:
+                        for i, nw in enumerate(batch['num_windows']):
+                            if batch['hc_vs_pd'][i].item() != -1:
+                                num_windows_by_label_hc[batch['hc_vs_pd'][i].item()].append(nw)
+                            if batch['pd_vs_dd'][i].item() != -1:
+                                num_windows_by_label_pd[batch['pd_vs_dd'][i].item()].append(nw)
+
+                    # Analyze HC vs PD
+                    if len(num_windows_by_label_hc[0]) > 0 and len(num_windows_by_label_hc[1]) > 0:
+                        avg_hc = np.mean(num_windows_by_label_hc[0])
+                        avg_pd = np.mean(num_windows_by_label_hc[1])
+                        print(f"   HC vs PD - Avg windows: HC={avg_hc:.2f}, PD={avg_pd:.2f}")
+                        if abs(avg_hc - avg_pd) > 2:
+                            print(f"   ⚠️  SUSPICIOUS: Large difference in num_windows!")
+                            print(f"   Model might be using window count to classify!")
+
+                    # Analyze PD vs DD
+                    if len(num_windows_by_label_pd[0]) > 0 and len(num_windows_by_label_pd[1]) > 0:
+                        avg_pd2 = np.mean(num_windows_by_label_pd[0])
+                        avg_dd = np.mean(num_windows_by_label_pd[1])
+                        print(f"   PD vs DD - Avg windows: PD={avg_pd2:.2f}, DD={avg_dd:.2f}")
+                        if abs(avg_pd2 - avg_dd) > 2:
+                            print(f"   ⚠️  SUSPICIOUS: Large difference in num_windows!")
+                            print(f"   Model might be using window count to classify!")
+
+                    # Additional diagnostic
+                    if len(train_patient_ids) == 0 or len(val_patient_ids) == 0:
+                        print(f"\n⚠️  WARNING: Patient IDs not being collected properly!")
+                        print(f"   Train IDs collected: {len(train_patient_ids) > 0}")
+                        print(f"   Val IDs collected: {len(val_patient_ids) > 0}")
+                        print(f"   Can't verify absence of data leakage!")
+                        print(f"   100% accuracy might be due to undetected leakage.")
+
+                print("="*70 + "\n")
             # ===============================================================
 
             # Calculate average accuracy across both tasks
