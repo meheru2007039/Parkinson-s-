@@ -179,18 +179,19 @@ class ParkinsonsDatasetLoader(Dataset):
                     patient_text = ""
                 
                 # Determine labels and overlap
+                # IMPORTANT: Use SAME overlap for all groups to prevent num_windows leakage!
+                # Different overlaps create different window counts, which the model can exploit
+                overlap = 0.0  # Use same overlap for all patient groups
+
                 if condition == 'Healthy':
                     hc_vs_pd_label = 0
                     pd_vs_dd_label = -1
-                    overlap = 0.70
                 elif 'Parkinson' in condition:
                     hc_vs_pd_label = 1
                     pd_vs_dd_label = 0
-                    overlap = 0
                 else:
                     hc_vs_pd_label = -1
                     pd_vs_dd_label = 1
-                    overlap = 0.65
                 
                 # Process each task separately
                 for task in self.tasks:
