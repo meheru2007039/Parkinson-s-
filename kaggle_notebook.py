@@ -1118,11 +1118,15 @@ def validation_phase(model, dataloader, criterion, device, debug_patient_ids=Fal
 
             # Track patient IDs for debugging
             if debug_patient_ids and num_batches == 0:  # First batch only
-                print(f"\n[DEBUG] Batch keys: {list(batch.keys())}")
-                print(f"[DEBUG] 'patient_ids' in batch: {'patient_ids' in batch}")
+                print("\n" + "="*60)
+                print("VALIDATION BATCH STRUCTURE:")
+                print("="*60)
+                print(f"Batch keys: {list(batch.keys())}")
+                print(f"'patient_ids' in batch: {'patient_ids' in batch}")
                 if 'patient_ids' in batch:
-                    print(f"[DEBUG] First batch patient_ids type: {type(batch['patient_ids'])}")
-                    print(f"[DEBUG] First batch patient_ids: {batch['patient_ids']}")
+                    print(f"Type of patient_ids: {type(batch['patient_ids'])}")
+                    print(f"First 5 patient IDs: {batch['patient_ids'][:5]}")
+                print("="*60)
 
             if 'patient_ids' in batch:
                 val_patient_ids.update(batch['patient_ids'])
@@ -1158,11 +1162,14 @@ def validation_phase(model, dataloader, criterion, device, debug_patient_ids=Fal
 
                 # Debug: Print first batch predictions
                 if debug_patient_ids and num_batches == 1:
-                    print(f"\n[DEBUG] First batch HC vs PD:")
-                    print(f"   Logits (first 5): {logits_hc_vs_pd[valid_hc_mask][:5].cpu().numpy()}")
-                    print(f"   Labels (first 10): {batch['hc_vs_pd'][valid_hc_mask][:10].cpu().numpy()}")
-                    print(f"   Predictions (first 10): {preds_hc[valid_hc_mask][:10].cpu().numpy()}")
-                    print(f"   Probabilities (first 5): {probs_hc[valid_hc_mask][:5, 1].cpu().numpy()}")
+                    print("\n" + "="*60)
+                    print("FIRST BATCH PREDICTIONS (HC vs PD):")
+                    print("="*60)
+                    print(f"Logits (first 5):\n{logits_hc_vs_pd[valid_hc_mask][:5].cpu().numpy()}")
+                    print(f"\nTrue Labels (first 10): {batch['hc_vs_pd'][valid_hc_mask][:10].cpu().numpy()}")
+                    print(f"Predictions (first 10): {preds_hc[valid_hc_mask][:10].cpu().numpy()}")
+                    print(f"\nProbabilities for class 1 (first 5): {probs_hc[valid_hc_mask][:5, 1].cpu().numpy()}")
+                    print("="*60)
 
                 all_labels_hc.extend(batch['hc_vs_pd'][valid_hc_mask].cpu().numpy())
                 all_preds_hc.extend(preds_hc[valid_hc_mask].cpu().numpy())
@@ -1207,11 +1214,15 @@ def validation_phase(model, dataloader, criterion, device, debug_patient_ids=Fal
 
     # Debug patient IDs
     if debug_patient_ids:
-        print(f"\n[DEBUG] Validation set has {len(val_patient_ids)} unique patients")
+        print("\n" + "="*60)
+        print("VALIDATION SET PATIENT IDs:")
+        print("="*60)
+        print(f"Total unique patients in validation: {len(val_patient_ids)}")
         if len(val_patient_ids) > 0:
-            print(f"[DEBUG] Sample patient IDs: {sorted(list(val_patient_ids))[:10]}")
+            print(f"Sample patient IDs: {sorted(list(val_patient_ids))[:10]}")
         else:
-            print(f"[DEBUG] WARNING: No patient IDs collected from validation set!")
+            print("[ERROR] No patient IDs collected from validation set!")
+        print("="*60)
 
     return avg_loss, metrics_hc, metrics_pd, all_features, all_hc_pd_labels_viz, all_pd_dd_labels_viz, val_patient_ids
 
@@ -1289,20 +1300,28 @@ def train_model(config):
         )
 
         # ============ COLLECT TRAIN PATIENT IDS FOR DEBUGGING ============
+        print("\n" + "="*60)
+        print("COLLECTING TRAIN PATIENT IDs FOR DEBUGGING...")
+        print("="*60)
         train_patient_ids = set()
         batch_count = 0
         for batch in train_loader:
-            batch_count += 1
-            if batch_count == 1:  # First batch debug
-                print(f"\n[DEBUG TRAIN] First batch keys: {list(batch.keys())}")
-                print(f"[DEBUG TRAIN] 'patient_ids' in batch: {'patient_ids' in batch}")
+            if batch_count == 0:  # First batch debug
+                print(f"[DEBUG] First TRAIN batch keys: {list(batch.keys())}")
+                print(f"[DEBUG] 'patient_ids' in batch: {'patient_ids' in batch}")
+                if 'patient_ids' in batch:
+                    print(f"[DEBUG] Type of patient_ids: {type(batch['patient_ids'])}")
+                    print(f"[DEBUG] First 5 patient IDs: {batch['patient_ids'][:5]}")
             if 'patient_ids' in batch:
                 train_patient_ids.update(batch['patient_ids'])
-        print(f"\n[DEBUG] Training set has {len(train_patient_ids)} unique patients")
+            batch_count += 1
+
+        print(f"\n[RESULT] Training set has {len(train_patient_ids)} unique patients")
         if len(train_patient_ids) > 0:
-            print(f"[DEBUG] Sample train patient IDs: {sorted(list(train_patient_ids))[:10]}")
+            print(f"[RESULT] Sample train patient IDs: {sorted(list(train_patient_ids))[:10]}")
         else:
-            print(f"[DEBUG] WARNING: No patient IDs collected from training set!")
+            print(f"[ERROR] No patient IDs collected from training set!")
+        print("="*60 + "\n")
         # ==================================================================
 
         # Track best model for this fold
@@ -1336,21 +1355,34 @@ def train_model(config):
 
             # ============ CHECK FOR DATA LEAKAGE ON FIRST EPOCH ============
             if epoch == 0:
+                print("\n" + "="*70)
+                print("DATA LEAKAGE CHECK - COMPARING TRAIN AND VALIDATION PATIENTS")
+                print("="*70)
+
                 overlap = train_patient_ids.intersection(val_patient_ids)
+
+                print(f"Train patients: {len(train_patient_ids)}")
+                print(f"Validation patients: {len(val_patient_ids)}")
+                print(f"Overlapping patients: {len(overlap)}")
+
                 if overlap:
-                    print(f"\n🚨 CRITICAL: DATA LEAKAGE DETECTED IN FOLD {fold_idx+1}!")
+                    print(f"\n🚨🚨🚨 CRITICAL: DATA LEAKAGE DETECTED! 🚨🚨🚨")
                     print(f"   {len(overlap)} patients appear in BOTH train and validation!")
                     print(f"   Overlapping IDs: {sorted(list(overlap))[:20]}")
-                    print(f"   This explains 100% accuracy - MODEL IS CHEATING!\n")
+                    print(f"   This EXPLAINS the 100% accuracy - MODEL IS CHEATING!")
+                    print(f"🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨")
                 else:
-                    print(f"\n✓ No train/val patient overlap in fold {fold_idx+1}")
-                    print(f"   Train patients: {len(train_patient_ids)}, Val patients: {len(val_patient_ids)}")
+                    print(f"\n✓✓✓ GOOD NEWS: No train/val patient overlap detected!")
 
-                # Additional diagnostic: Check if we're getting any patient IDs at all
-                if len(train_patient_ids) == 0 or len(val_patient_ids) == 0:
-                    print(f"\n⚠️  WARNING: Patient IDs not being collected properly!")
-                    print(f"   This means we can't verify data leakage is absent.")
-                    print(f"   The 100% accuracy might still be due to leakage we can't detect.")
+                    # Additional diagnostic
+                    if len(train_patient_ids) == 0 or len(val_patient_ids) == 0:
+                        print(f"\n⚠️  WARNING: Patient IDs not being collected properly!")
+                        print(f"   Train IDs collected: {len(train_patient_ids) > 0}")
+                        print(f"   Val IDs collected: {len(val_patient_ids) > 0}")
+                        print(f"   Can't verify absence of data leakage!")
+                        print(f"   100% accuracy might be due to undetected leakage.")
+
+                print("="*70 + "\n")
             # ===============================================================
 
             # Calculate average accuracy across both tasks
