@@ -21,7 +21,7 @@ from sklearn.metrics import roc_curve, auc
 # ============================================================================
 # config
 # ============================================================================
-def config():
+def get_config():
     config = {
         'data_root': "/kaggle/input/parkinsons/pads-parkinsons-disease-smartwatch-dataset-1.0.0",
         'apply_downsampling': True,
@@ -1346,10 +1346,10 @@ def train_model(config):
     return all_fold_results
 
 def main():
-    config = config()
-    
+    config = get_config()
+
     results = train_model(config)
-    
+
     return results
 
 
