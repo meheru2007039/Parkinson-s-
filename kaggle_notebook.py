@@ -308,7 +308,19 @@ class ParkinsonsDatasetLoader(Dataset):
         for fold_id, (train_idx, test_idx) in enumerate(skf.split(patient_list, patient_labels)):
             train_patients = set([patient_list[i] for i in train_idx])
             test_patients = set([patient_list[i] for i in test_idx])
-            
+
+            # ============ DATA LEAKAGE CHECK ============
+            overlap = train_patients.intersection(test_patients)
+            if overlap:
+                print(f"\n⚠️  WARNING: FOLD {fold_id+1} HAS DATA LEAKAGE!")
+                print(f"   Overlapping patients: {sorted(list(overlap))[:10]}... (showing first 10)")
+            else:
+                print(f"\n✓ Fold {fold_id+1}: No patient overlap detected")
+
+            print(f"   Train patients: {len(train_patients)} (IDs: {sorted(list(train_patients))[:5]}...)")
+            print(f"   Test patients:  {len(test_patients)} (IDs: {sorted(list(test_patients))[:5]}...)")
+            # ============================================
+
             # Split patient-task data
             train_data = [pt for pt in self.patient_task_data if pt['patient_id'] in train_patients]
             test_data = [pt for pt in self.patient_task_data if pt['patient_id'] in test_patients]
@@ -1067,7 +1079,7 @@ def training_phase(model, dataloader, criterion, optimizer, device, gradient_acc
     avg_loss = total_loss / num_batches if num_batches > 0 else 0
     return avg_loss 
 
-def validation_phase(model, dataloader, criterion, device):
+def validation_phase(model, dataloader, criterion, device, debug_patient_ids=False):
     """
     Validation phase.
     Returns validation loss and metrics for both tasks.
@@ -1090,6 +1102,9 @@ def validation_phase(model, dataloader, criterion, device):
     all_hc_pd_labels_viz = []
     all_pd_dd_labels_viz = []
 
+    # Debug: Track patient IDs
+    val_patient_ids = set()
+
     progress_bar = tqdm(dataloader, desc="Validation", leave=False)
 
     with torch.no_grad():
@@ -1100,6 +1115,10 @@ def validation_phase(model, dataloader, criterion, device):
 
             # Forward pass
             logits_hc_vs_pd, logits_pd_vs_dd = model(batch)
+
+            # Track patient IDs for debugging
+            if 'patient_ids' in batch:
+                val_patient_ids.update(batch['patient_ids'])
 
             # Extract features for visualization
             features_dict = model.get_features(batch)
@@ -1171,7 +1190,12 @@ def validation_phase(model, dataloader, criterion, device):
         all_hc_pd_labels_viz = None
         all_pd_dd_labels_viz = None
 
-    return avg_loss, metrics_hc, metrics_pd, all_features, all_hc_pd_labels_viz, all_pd_dd_labels_viz
+    # Debug patient IDs
+    if debug_patient_ids:
+        print(f"\n[DEBUG] Validation set has {len(val_patient_ids)} unique patients")
+        print(f"[DEBUG] Sample patient IDs: {sorted(list(val_patient_ids))[:10]}")
+
+    return avg_loss, metrics_hc, metrics_pd, all_features, all_hc_pd_labels_viz, all_pd_dd_labels_viz, val_patient_ids
 
 def train_model(config):
     """
@@ -1246,6 +1270,15 @@ def train_model(config):
             weight_decay=config['weight_decay']
         )
 
+        # ============ COLLECT TRAIN PATIENT IDS FOR DEBUGGING ============
+        train_patient_ids = set()
+        for batch in train_loader:
+            if 'patient_ids' in batch:
+                train_patient_ids.update(batch['patient_ids'])
+        print(f"\n[DEBUG] Training set has {len(train_patient_ids)} unique patients")
+        print(f"[DEBUG] Sample train patient IDs: {sorted(list(train_patient_ids))[:10]}")
+        # ==================================================================
+
         # Track best model for this fold
         best_val_acc = 0.0
         best_epoch = 0
@@ -1270,10 +1303,22 @@ def train_model(config):
                 gradient_accumulation_steps=config['gradient_accumulation_steps']
             )
 
-            # Validation phase
-            val_loss, val_metrics_hc, val_metrics_pd, features, hc_labels, pd_labels = validation_phase(
-                model, val_loader, criterion, device
+            # Validation phase (debug patient IDs on first epoch)
+            val_loss, val_metrics_hc, val_metrics_pd, features, hc_labels, pd_labels, val_patient_ids = validation_phase(
+                model, val_loader, criterion, device, debug_patient_ids=(epoch == 0)
             )
+
+            # ============ CHECK FOR DATA LEAKAGE ON FIRST EPOCH ============
+            if epoch == 0:
+                overlap = train_patient_ids.intersection(val_patient_ids)
+                if overlap:
+                    print(f"\n🚨 CRITICAL: DATA LEAKAGE DETECTED IN FOLD {fold_idx+1}!")
+                    print(f"   {len(overlap)} patients appear in BOTH train and validation!")
+                    print(f"   Overlapping IDs: {sorted(list(overlap))[:20]}")
+                    print(f"   This explains 100% accuracy - MODEL IS CHEATING!\n")
+                else:
+                    print(f"\n✓ No train/val patient overlap in fold {fold_idx+1}")
+            # ===============================================================
 
             # Calculate average accuracy across both tasks
             acc_hc = val_metrics_hc.get('accuracy', 0) if val_metrics_hc else 0
