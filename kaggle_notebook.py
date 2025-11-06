@@ -143,10 +143,28 @@ class ParkinsonsDatasetLoader(Dataset):
             print(f"Loading dataset: {len(self.patient_ids_list)} patients")
             
             self._load_data()
+
+            # ========== SHUFFLE LABELS RANDOMLY ==========
+            # Extract all labels
+            all_labels_hc = [e['hc_vs_pd'] for e in self.patient_task_data]
+            all_labels_pd = [e['pd_vs_dd'] for e in self.patient_task_data]
+
+            # Shuffle both separately (but match lengths)
+            random.shuffle(all_labels_hc)
+            random.shuffle(all_labels_pd)
+
+            # Assign back randomly shuffled labels
+            for i, e in enumerate(self.patient_task_data):
+                e['hc_vs_pd'] = all_labels_hc[i]
+                e['pd_vs_dd'] = all_labels_pd[i]
+
+            print("✓ Labels have been randomly shuffled!")
+            # ============================================
+
         elif patient_task_data is not None:
             # For split datasets
             self.patient_task_data = patient_task_data
-        
+
         print(f"Total patient-task combinations: {len(self.patient_task_data)}")
     
     
