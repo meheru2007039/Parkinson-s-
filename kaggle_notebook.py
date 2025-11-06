@@ -1117,6 +1117,13 @@ def validation_phase(model, dataloader, criterion, device, debug_patient_ids=Fal
             logits_hc_vs_pd, logits_pd_vs_dd = model(batch)
 
             # Track patient IDs for debugging
+            if debug_patient_ids and num_batches == 0:  # First batch only
+                print(f"\n[DEBUG] Batch keys: {list(batch.keys())}")
+                print(f"[DEBUG] 'patient_ids' in batch: {'patient_ids' in batch}")
+                if 'patient_ids' in batch:
+                    print(f"[DEBUG] First batch patient_ids type: {type(batch['patient_ids'])}")
+                    print(f"[DEBUG] First batch patient_ids: {batch['patient_ids']}")
+
             if 'patient_ids' in batch:
                 val_patient_ids.update(batch['patient_ids'])
 
@@ -1148,6 +1155,14 @@ def validation_phase(model, dataloader, criterion, device, debug_patient_ids=Fal
             if valid_hc_mask.sum() > 0:
                 probs_hc = torch.softmax(logits_hc_vs_pd, dim=1)
                 preds_hc = torch.argmax(logits_hc_vs_pd, dim=1)
+
+                # Debug: Print first batch predictions
+                if debug_patient_ids and num_batches == 1:
+                    print(f"\n[DEBUG] First batch HC vs PD:")
+                    print(f"   Logits (first 5): {logits_hc_vs_pd[valid_hc_mask][:5].cpu().numpy()}")
+                    print(f"   Labels (first 10): {batch['hc_vs_pd'][valid_hc_mask][:10].cpu().numpy()}")
+                    print(f"   Predictions (first 10): {preds_hc[valid_hc_mask][:10].cpu().numpy()}")
+                    print(f"   Probabilities (first 5): {probs_hc[valid_hc_mask][:5, 1].cpu().numpy()}")
 
                 all_labels_hc.extend(batch['hc_vs_pd'][valid_hc_mask].cpu().numpy())
                 all_preds_hc.extend(preds_hc[valid_hc_mask].cpu().numpy())
@@ -1193,7 +1208,10 @@ def validation_phase(model, dataloader, criterion, device, debug_patient_ids=Fal
     # Debug patient IDs
     if debug_patient_ids:
         print(f"\n[DEBUG] Validation set has {len(val_patient_ids)} unique patients")
-        print(f"[DEBUG] Sample patient IDs: {sorted(list(val_patient_ids))[:10]}")
+        if len(val_patient_ids) > 0:
+            print(f"[DEBUG] Sample patient IDs: {sorted(list(val_patient_ids))[:10]}")
+        else:
+            print(f"[DEBUG] WARNING: No patient IDs collected from validation set!")
 
     return avg_loss, metrics_hc, metrics_pd, all_features, all_hc_pd_labels_viz, all_pd_dd_labels_viz, val_patient_ids
 
@@ -1272,11 +1290,19 @@ def train_model(config):
 
         # ============ COLLECT TRAIN PATIENT IDS FOR DEBUGGING ============
         train_patient_ids = set()
+        batch_count = 0
         for batch in train_loader:
+            batch_count += 1
+            if batch_count == 1:  # First batch debug
+                print(f"\n[DEBUG TRAIN] First batch keys: {list(batch.keys())}")
+                print(f"[DEBUG TRAIN] 'patient_ids' in batch: {'patient_ids' in batch}")
             if 'patient_ids' in batch:
                 train_patient_ids.update(batch['patient_ids'])
         print(f"\n[DEBUG] Training set has {len(train_patient_ids)} unique patients")
-        print(f"[DEBUG] Sample train patient IDs: {sorted(list(train_patient_ids))[:10]}")
+        if len(train_patient_ids) > 0:
+            print(f"[DEBUG] Sample train patient IDs: {sorted(list(train_patient_ids))[:10]}")
+        else:
+            print(f"[DEBUG] WARNING: No patient IDs collected from training set!")
         # ==================================================================
 
         # Track best model for this fold
@@ -1318,6 +1344,13 @@ def train_model(config):
                     print(f"   This explains 100% accuracy - MODEL IS CHEATING!\n")
                 else:
                     print(f"\n✓ No train/val patient overlap in fold {fold_idx+1}")
+                    print(f"   Train patients: {len(train_patient_ids)}, Val patients: {len(val_patient_ids)}")
+
+                # Additional diagnostic: Check if we're getting any patient IDs at all
+                if len(train_patient_ids) == 0 or len(val_patient_ids) == 0:
+                    print(f"\n⚠️  WARNING: Patient IDs not being collected properly!")
+                    print(f"   This means we can't verify data leakage is absent.")
+                    print(f"   The 100% accuracy might still be due to leakage we can't detect.")
             # ===============================================================
 
             # Calculate average accuracy across both tasks
