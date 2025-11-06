@@ -44,7 +44,8 @@ def get_config():
         'num_classes': 2,
         'use_text': False,
         
-        'batch_size': 64,
+        'batch_size': 8,  # Actual batch size in memory
+        'gradient_accumulation_steps': 8,  # Effective batch size = 8 * 8 = 64
         'learning_rate': 0.0005,
         'weight_decay': 0.01,
         'num_epochs': 100,
@@ -982,18 +983,32 @@ def plot_tsne(features, hc_pd_labels, pd_dd_labels, output_dir="plots"):
 # Trainer
 # ============================================================================
 
-def training_phase(model, dataloader, criterion, optimizer, device):
+def training_phase(model, dataloader, criterion, optimizer, device, gradient_accumulation_steps=1):
     """
-    Training phase for one epoch.
-    Returns average training loss.
+    Training phase for one epoch with gradient accumulation.
+
+    Args:
+        model: The model to train
+        dataloader: Training data loader
+        criterion: Loss function
+        optimizer: Optimizer
+        device: Device to train on
+        gradient_accumulation_steps: Number of steps to accumulate gradients before updating
+
+    Returns:
+        Average training loss for the epoch
     """
     model.train()
     total_loss = 0.0
     num_batches = 0
+    accumulated_loss = 0.0
 
     progress_bar = tqdm(dataloader, desc="Training", leave=False)
 
-    for batch in progress_bar:
+    # Zero gradients at the start
+    optimizer.zero_grad()
+
+    for batch_idx, batch in enumerate(progress_bar):
         # Move batch to device
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()}
@@ -1018,15 +1033,36 @@ def training_phase(model, dataloader, criterion, optimizer, device):
         # Combined loss
         loss = loss_hc + loss_pd
 
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        # Scale loss by accumulation steps (to average gradients)
+        loss = loss / gradient_accumulation_steps
 
-        total_loss += loss.item()
+        # Backward pass (accumulate gradients)
+        loss.backward()
+
+        accumulated_loss += loss.item()
+        total_loss += loss.item() * gradient_accumulation_steps  # Unscale for logging
         num_batches += 1
 
-        progress_bar.set_postfix({'loss': loss.item()})
+        # Update weights every gradient_accumulation_steps
+        if (batch_idx + 1) % gradient_accumulation_steps == 0:
+            optimizer.step()
+            optimizer.zero_grad()
+
+            progress_bar.set_postfix({
+                'loss': accumulated_loss * gradient_accumulation_steps,
+                'eff_batch': (batch_idx + 1) // gradient_accumulation_steps
+            })
+            accumulated_loss = 0.0
+        else:
+            progress_bar.set_postfix({
+                'loss': accumulated_loss * gradient_accumulation_steps,
+                'accum': (batch_idx + 1) % gradient_accumulation_steps
+            })
+
+    # Update for any remaining accumulated gradients
+    if num_batches % gradient_accumulation_steps != 0:
+        optimizer.step()
+        optimizer.zero_grad()
 
     avg_loss = total_loss / num_batches if num_batches > 0 else 0
     return avg_loss 
@@ -1229,7 +1265,10 @@ def train_model(config):
             print(f"\n--- Epoch {epoch+1}/{num_epochs} ---")
 
             # Training phase
-            train_loss = training_phase(model, train_loader, criterion, optimizer, device)
+            train_loss = training_phase(
+                model, train_loader, criterion, optimizer, device,
+                gradient_accumulation_steps=config['gradient_accumulation_steps']
+            )
 
             # Validation phase
             val_loss, val_metrics_hc, val_metrics_pd, features, hc_labels, pd_labels = validation_phase(
