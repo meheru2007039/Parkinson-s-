@@ -85,58 +85,34 @@ def bandpass_filter(signal, original_freq=64, upper_bound=20, lower_bound=0.1):
     return filtfilt(b, a, signal, axis=0)
 
 
-def prepare_text(metadata, questionnaires):
-    text_array = []
-    
-    if metadata:
-        text_array.append(f"Age: {metadata.get('age', 'unknown')}")
-        text_array.append(f"Gender: {metadata.get('gender', 'unknown')}")
-        if metadata.get('age_at_diagnosis'):
-            text_array.append(f"Age at diagnosis: {metadata.get('age_at_diagnosis')}")
-        if metadata.get('disease_comment'):
-            text_array.append(f"Clinical notes: {metadata.get('disease_comment')}")
-    
-    if questionnaires and 'item' in questionnaires:
-        for item in questionnaires['item']:
-            q_text = item.get('text', '')
-            q_answer = item.get('answer', '')
-            if q_text and q_answer:
-                text_array.append(f"Q: {q_text} A: {q_answer}")
-    
-    return " ".join(text_array) if text_array else "No information available."
-
-
 # ============================================================================
 # DataLoader
 # ============================================================================
 class ParkinsonsDatasetLoader(Dataset):
-    def __init__(self, data_root: str = None, window_size: int = 256, 
+    def __init__(self, data_root: str = None, window_size: int = 256,
                  max_windows_per_task: int = 10,  # Max windows to include per task
                  min_windows_per_task: int = 2,   # Min windows required for a task
                  patient_task_data=None,          # For split datasets
                  apply_downsampling=True,
-                 apply_bandpass_filter=True, 
-                 apply_prepare_text=True):
-        
+                 apply_bandpass_filter=True):
+
         self.window_size = window_size
         self.max_windows_per_task = max_windows_per_task
         self.min_windows_per_task = min_windows_per_task
         self.apply_downsampling = apply_downsampling
         self.apply_bandpass_filter = apply_bandpass_filter
-        self.apply_prepare_text = apply_prepare_text
         self.data_root = data_root
-        
+
         # Store patient-task combinations
-        # Each entry: {patient_id, task_name, left_windows, right_windows, 
-        #              hc_vs_pd, pd_vs_dd, patient_text, num_windows}
+        # Each entry: {patient_id, task_name, left_windows, right_windows,
+        #              hc_vs_pd, pd_vs_dd, num_windows}
         self.patient_task_data = []
         
         if data_root is not None:
             self.patients_template = pathlib.Path(data_root) / "patients" / "patient_{p:03d}.json"
             self.timeseries_template = pathlib.Path(data_root) / "movement" / "timeseries" / "{N:03d}_{X}_{Y}.txt"
-            self.questionnaires_template = pathlib.Path(data_root) / "questionnaire" / "questionnaire_response_{p:03d}.json"
-            
-            self.tasks = ["CrossArms", "DrinkGlas", "Entrainment", "HoldWeight", "LiftHold", 
+
+            self.tasks = ["CrossArms", "DrinkGlas", "Entrainment", "HoldWeight", "LiftHold",
                          "PointFinger", "Relaxed", "StretchHold", "TouchIndex", "TouchNose"]
             
             self.patient_ids_list = list(range(1, 470))
@@ -155,42 +131,29 @@ class ParkinsonsDatasetLoader(Dataset):
         
         for patient_id in tqdm(self.patient_ids_list, desc="Loading patient-task data"):
             patient_path = pathlib.Path(str(self.patients_template).format(p=patient_id))
-            questionnaire_path = pathlib.Path(str(self.questionnaires_template).format(p=patient_id))
-            
+
             if not patient_path.exists():
                 continue
-            
+
             try:
                 with open(patient_path, 'r') as f:
                     metadata = json.load(f)
-                
-                condition = metadata.get('condition', '')
-                questionnaire = {}
-                try:
-                    with open(questionnaire_path, 'r') as f:
-                        questionnaire = json.load(f)
-                except:
-                    pass
-                
-                # Prepare patient text
-                if self.apply_prepare_text:
-                    patient_text = prepare_text(metadata, questionnaire)
-                else:
-                    patient_text = ""
-                
-                # Determine labels (use uniform overlap to prevent data leakage)
-                # FIXED: All conditions now use the same overlap value
-                overlap = 0.5  # Uniform overlap for all conditions
 
+                condition = metadata.get('condition', '')
+
+                # Determine labels and overlap (differential sampling for class imbalance)
                 if condition == 'Healthy':
                     hc_vs_pd_label = 0
                     pd_vs_dd_label = -1
+                    overlap = 0.70
                 elif 'Parkinson' in condition:
                     hc_vs_pd_label = 1
                     pd_vs_dd_label = 0
+                    overlap = 0
                 else:
                     hc_vs_pd_label = -1
                     pd_vs_dd_label = 1
+                    overlap = 0.65
                 
                 # Process each task separately
                 for task in self.tasks:
@@ -250,7 +213,6 @@ class ParkinsonsDatasetLoader(Dataset):
                                     'right_windows': right_windows[:num_windows], # shape: (num_windows, 256, 6)
                                     'hc_vs_pd': hc_vs_pd_label,
                                     'pd_vs_dd': pd_vs_dd_label,
-                                    'patient_text': patient_text,
                                     'num_windows': num_windows
                                 })
                     
@@ -366,22 +328,20 @@ class ParkinsonsDatasetLoader(Dataset):
     def __getitem__(self, idx):
         """Returns ONE patient-task combination with ALL its windows."""
         pt_data = self.patient_task_data[idx]
-        
+
         left_windows = torch.FloatTensor(pt_data['left_windows'])   # (num_windows, 256, 6)
         right_windows = torch.FloatTensor(pt_data['right_windows']) # (num_windows, 256, 6)
         hc_vs_pd = torch.LongTensor([pt_data['hc_vs_pd']])
         pd_vs_dd = torch.LongTensor([pt_data['pd_vs_dd']])
-        patient_text = pt_data['patient_text']
         num_windows = pt_data['num_windows']
         patient_id = pt_data['patient_id']
         task_name = pt_data['task_name']
-        
+
         return {
             'left_windows': left_windows,
             'right_windows': right_windows,
             'hc_vs_pd': hc_vs_pd.squeeze(),
             'pd_vs_dd': pd_vs_dd.squeeze(),
-            'patient_text': patient_text,
             'num_windows': num_windows,
             'patient_id': patient_id,
             'task_name': task_name
@@ -408,33 +368,30 @@ def collate_fn(batch):
     
     hc_vs_pd_labels = []
     pd_vs_dd_labels = []
-    patient_texts = []
     num_windows_list = []
     patient_ids = []
     task_names = []
-    
+
     for i, item in enumerate(batch):
         num_win = item['num_windows']
-        
+
         # Copy actual data
         left_windows_padded[i, :num_win] = item['left_windows']
         right_windows_padded[i, :num_win] = item['right_windows']
         masks[i, :num_win] = True
-        
+
         hc_vs_pd_labels.append(item['hc_vs_pd'])
         pd_vs_dd_labels.append(item['pd_vs_dd'])
-        patient_texts.append(item['patient_text'])
         num_windows_list.append(num_win)
         patient_ids.append(item['patient_id'])
         task_names.append(item['task_name'])
-    
+
     return {
-        'left_windows': left_windows_padded,      
-        'right_windows': right_windows_padded,    
-        'masks': masks,                            
-        'hc_vs_pd': torch.stack(hc_vs_pd_labels), 
+        'left_windows': left_windows_padded,
+        'right_windows': right_windows_padded,
+        'masks': masks,
+        'hc_vs_pd': torch.stack(hc_vs_pd_labels),
         'pd_vs_dd': torch.stack(pd_vs_dd_labels),
-        'patient_texts': patient_texts,
         'num_windows': num_windows_list,
         'patient_ids': patient_ids,
         'task_names': task_names
@@ -447,45 +404,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from transformers import BertTokenizer, BertModel
-
-class TextTokenizer(nn.Module):
-
-    def __init__(self, model_name='bert-base-uncased', output_dim=128, dropout=0.1):
-        super().__init__()
-
-        # Load tokenizer ONCE in __init__ instead of every forward pass
-        self.tokenizer = BertTokenizer.from_pretrained(model_name)
-        self.bert = BertModel.from_pretrained(model_name)
-
-        # Freeze BERT parameters - we're using it as a feature extractor
-        for param in self.bert.parameters():
-            param.requires_grad = False
-
-        input_dim = self.bert.config.hidden_size
-
-        self.projection = nn.Sequential(
-            nn.Linear(input_dim, output_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.LayerNorm(output_dim)
-        )
-
-    def forward(self, text_list, device):
-        # Use the pre-loaded tokenizer
-        tokens = self.tokenizer(text_list, padding=True, truncation=True,
-                               max_length=512, return_tensors="pt")
-
-        input_ids = tokens['input_ids'].to(device)
-        attention_mask = tokens['attention_mask'].to(device)
-
-        # Always use no_grad since BERT is frozen
-        with torch.no_grad():
-            outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-
-        output = outputs.pooler_output
-
-        return self.projection(output)
 
 class PositionalEncoding(nn.Module):
     def __init__(self, model_dim: int, max_len: int = 5000):
@@ -564,7 +482,7 @@ class CrossAttention(nn.Module):
 class MyModel(nn.Module):
     def __init__(
         self,
-        input_dim: int = 6,  
+        input_dim: int = 6,
         model_dim: int = 128,
         num_heads: int = 8,
         num_window_layers: int = 4,  # Number of cross-attention layers at window level
@@ -572,35 +490,30 @@ class MyModel(nn.Module):
         d_ff: int = 512,
         dropout: float = 0.1,
         seq_len: int = 256,
-        use_text: bool = True,  
-        text_encoder_dim: int = 128,  
-        fusion_method: str = 'concat',
     ):
         super().__init__()
-        
+
         self.model_dim = model_dim
         self.seq_len = seq_len
-        self.use_text = use_text
-        self.fusion_method = fusion_method
-        
+
         # ========== LEVEL 1: Window-Level Processing ==========
         self.left_projection = nn.Linear(input_dim, model_dim)
         self.right_projection = nn.Linear(input_dim, model_dim)
-        
+
         # Positional encoding
         self.positional_encoding = PositionalEncoding(model_dim, max_len=seq_len)
-        
-        # Cross-attention layers 
+
+        # Cross-attention layers
         self.window_layers = nn.ModuleList([
-            CrossAttention(model_dim, num_heads, d_ff, dropout) 
+            CrossAttention(model_dim, num_heads, d_ff, dropout)
             for _ in range(num_window_layers)
         ])
-        
+
         self.global_pool = nn.AdaptiveAvgPool1d(1)
-        
+
         # ========== LEVEL 2: Task-Level Processing ==========
         self.window_positional_encoding = PositionalEncoding(model_dim * 2, max_len=100)  # max 100 windows
-        
+
         self.task_layers = nn.ModuleList([
             nn.ModuleDict({
                 'self_attention': nn.MultiheadAttention(
@@ -614,48 +527,31 @@ class MyModel(nn.Module):
             })
             for _ in range(num_task_layers)
         ])
-        
+
         # Task-level pooling
         self.task_attention_pooling = nn.Sequential(
             nn.Linear(model_dim * 2, 1),
             nn.Softmax(dim=1)
         )
-        
-        # ========== Text Encoder ==========
-        if use_text:
-            self.text_encoder = TextTokenizer(output_dim=text_encoder_dim, dropout=dropout)
-            
-            if fusion_method == 'concat':
-                fusion_dim = model_dim * 2 + text_encoder_dim
-            elif fusion_method == 'attention':
-                fusion_dim = model_dim * 2
-                self.fusion_attention = nn.MultiheadAttention(
-                    embed_dim=model_dim * 2,
-                    num_heads=num_heads,
-                    dropout=dropout,
-                    batch_first=True  
-                )
-                self.text_to_signal = nn.Linear(text_encoder_dim, model_dim * 2)
-            else:
-                raise ValueError(f"Unknown fusion method: {fusion_method}")
-        else:
-            fusion_dim = model_dim * 2
 
         # ========== Classification Heads ==========
+        # No text encoder - using only signal features
+        fusion_dim = model_dim * 2
+
         self.head_hc_vs_pd = nn.Sequential(
             nn.Linear(fusion_dim, model_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(model_dim, 2)  # Binary: HC vs PD
         )
-        
+
         self.head_pd_vs_dd = nn.Sequential(
             nn.Linear(fusion_dim, model_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(model_dim, 2)  # Binary: PD vs DD
         )
-        
+
         self.dropout = nn.Dropout(dropout)
     
     
@@ -721,29 +617,11 @@ class MyModel(nn.Module):
         attention_weights = attention_weights / (attention_weights.sum(dim=1, keepdim=True) + 1e-8)
         
         task_representation = (task_features * attention_weights).sum(dim=1)  # (batch, model_dim*2)
-        
-        # ========== Text Fusion ==========
-        if self.use_text and batch['patient_texts'] is not None:
-            text_features = self.text_encoder(batch['patient_texts'], device)
-            
-            if self.fusion_method == 'concat':
-                fused_features = torch.cat([task_representation, text_features], dim=1)
-            elif self.fusion_method == 'attention':
-                text_transformed = self.text_to_signal(text_features).unsqueeze(1)
-                signal_features = task_representation.unsqueeze(1)
-                
-                fused_output, _ = self.fusion_attention(
-                    query=signal_features,
-                    key=text_transformed,
-                    value=text_transformed
-                )
-                fused_features = fused_output.squeeze(1)
-        else:
-            fused_features = task_representation
-        
+
         # ========== Classification ==========
-        logits_hc_vs_pd = self.head_hc_vs_pd(fused_features)
-        logits_pd_vs_dd = self.head_pd_vs_dd(fused_features)
+        # Using only signal features (no text)
+        logits_hc_vs_pd = self.head_hc_vs_pd(task_representation)
+        logits_pd_vs_dd = self.head_pd_vs_dd(task_representation)
         
         return logits_hc_vs_pd, logits_pd_vs_dd
     
@@ -796,30 +674,11 @@ class MyModel(nn.Module):
         attention_weights = attention_weights / (attention_weights.sum(dim=1, keepdim=True) + 1e-8)
         
         task_representation = (task_features * attention_weights).sum(dim=1)
-        
-        # Text fusion
-        if self.use_text and batch['patient_texts'] is not None:
-            text_features = self.text_encoder(batch['patient_texts'], device)
-            
-            if self.fusion_method == 'concat':
-                fused_features = torch.cat([task_representation, text_features], dim=1)
-            elif self.fusion_method == 'attention':
-                text_transformed = self.text_to_signal(text_features).unsqueeze(1)
-                signal_features = task_representation.unsqueeze(1)
-                
-                fused_output, _ = self.fusion_attention(
-                    query=signal_features,
-                    key=text_transformed,
-                    value=text_transformed
-                )
-                fused_features = fused_output.squeeze(1)
-        else:
-            fused_features = task_representation
-        
+
         return {
             'window_features': window_features,  # (batch, max_windows, model_dim*2)
             'task_representation': task_representation,  # (batch, model_dim*2)
-            'fused_features': fused_features,  # (batch, fusion_dim)
+            'fused_features': task_representation,  # (batch, model_dim*2) - no text, just signal features
             'attention_weights': attention_weights.squeeze(-1)  # (batch, max_windows)
         }
 # ============================================================================
@@ -1242,8 +1101,7 @@ def train_model(config):
         max_windows_per_task=10,
         min_windows_per_task=2,
         apply_downsampling=config['apply_downsampling'],
-        apply_bandpass_filter=config['apply_bandpass_filter'],
-        apply_prepare_text=config['apply_prepare_text']
+        apply_bandpass_filter=config['apply_bandpass_filter']
     )
 
     # Get k-fold splits
@@ -1288,8 +1146,7 @@ def train_model(config):
             num_task_layers=config['num_task_layers'],
             d_ff=config['d_ff'],
             dropout=config['dropout'],
-            seq_len=config['seq_len'],
-            use_text=config['use_text']
+            seq_len=config['seq_len']
         ).to(device)
 
         criterion = nn.CrossEntropyLoss()
