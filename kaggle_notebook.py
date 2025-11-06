@@ -12,6 +12,7 @@ from scipy.signal import butter, filtfilt
 import random
 import os
 import json
+import csv
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
 from sklearn.manifold import TSNE
@@ -981,68 +982,368 @@ def plot_tsne(features, hc_pd_labels, pd_dd_labels, output_dir="plots"):
 # ============================================================================
 
 def training_phase(model, dataloader, criterion, optimizer, device):
-    pass 
+    """
+    Training phase for one epoch.
+    Returns average training loss.
+    """
+    model.train()
+    total_loss = 0.0
+    num_batches = 0
+
+    progress_bar = tqdm(dataloader, desc="Training", leave=False)
+
+    for batch in progress_bar:
+        # Move batch to device
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()}
+
+        # Forward pass
+        logits_hc_vs_pd, logits_pd_vs_dd = model(batch)
+
+        # Calculate loss for HC vs PD (exclude -1 labels)
+        valid_hc_mask = batch['hc_vs_pd'] != -1
+        loss_hc = 0
+        if valid_hc_mask.sum() > 0:
+            loss_hc = criterion(logits_hc_vs_pd[valid_hc_mask],
+                               batch['hc_vs_pd'][valid_hc_mask])
+
+        # Calculate loss for PD vs DD (exclude -1 labels)
+        valid_pd_mask = batch['pd_vs_dd'] != -1
+        loss_pd = 0
+        if valid_pd_mask.sum() > 0:
+            loss_pd = criterion(logits_pd_vs_dd[valid_pd_mask],
+                               batch['pd_vs_dd'][valid_pd_mask])
+
+        # Combined loss
+        loss = loss_hc + loss_pd
+
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        num_batches += 1
+
+        progress_bar.set_postfix({'loss': loss.item()})
+
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0
+    return avg_loss 
 
 def validation_phase(model, dataloader, criterion, device):
-    pass
+    """
+    Validation phase.
+    Returns validation loss and metrics for both tasks.
+    """
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+
+    # Collect predictions and labels for both tasks
+    all_labels_hc = []
+    all_preds_hc = []
+    all_probs_hc = []
+
+    all_labels_pd = []
+    all_preds_pd = []
+    all_probs_pd = []
+
+    # Collect features for visualization
+    all_features = []
+    all_hc_pd_labels_viz = []
+    all_pd_dd_labels_viz = []
+
+    progress_bar = tqdm(dataloader, desc="Validation", leave=False)
+
+    with torch.no_grad():
+        for batch in progress_bar:
+            # Move batch to device
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                    for k, v in batch.items()}
+
+            # Forward pass
+            logits_hc_vs_pd, logits_pd_vs_dd = model(batch)
+
+            # Extract features for visualization
+            features_dict = model.get_features(batch)
+            features = features_dict['fused_features'].cpu().numpy()
+            all_features.append(features)
+            all_hc_pd_labels_viz.append(batch['hc_vs_pd'].cpu().numpy())
+            all_pd_dd_labels_viz.append(batch['pd_vs_dd'].cpu().numpy())
+
+            # Calculate loss
+            valid_hc_mask = batch['hc_vs_pd'] != -1
+            loss_hc = 0
+            if valid_hc_mask.sum() > 0:
+                loss_hc = criterion(logits_hc_vs_pd[valid_hc_mask],
+                                   batch['hc_vs_pd'][valid_hc_mask])
+
+            valid_pd_mask = batch['pd_vs_dd'] != -1
+            loss_pd = 0
+            if valid_pd_mask.sum() > 0:
+                loss_pd = criterion(logits_pd_vs_dd[valid_pd_mask],
+                                   batch['pd_vs_dd'][valid_pd_mask])
+
+            loss = loss_hc + loss_pd
+            total_loss += loss.item()
+            num_batches += 1
+
+            # Collect predictions for HC vs PD
+            if valid_hc_mask.sum() > 0:
+                probs_hc = torch.softmax(logits_hc_vs_pd, dim=1)
+                preds_hc = torch.argmax(logits_hc_vs_pd, dim=1)
+
+                all_labels_hc.extend(batch['hc_vs_pd'][valid_hc_mask].cpu().numpy())
+                all_preds_hc.extend(preds_hc[valid_hc_mask].cpu().numpy())
+                all_probs_hc.extend(probs_hc[valid_hc_mask, 1].cpu().numpy())  # Probability of positive class
+
+            # Collect predictions for PD vs DD
+            if valid_pd_mask.sum() > 0:
+                probs_pd = torch.softmax(logits_pd_vs_dd, dim=1)
+                preds_pd = torch.argmax(logits_pd_vs_dd, dim=1)
+
+                all_labels_pd.extend(batch['pd_vs_dd'][valid_pd_mask].cpu().numpy())
+                all_preds_pd.extend(preds_pd[valid_pd_mask].cpu().numpy())
+                all_probs_pd.extend(probs_pd[valid_pd_mask, 1].cpu().numpy())
+
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0
+
+    # Calculate metrics for HC vs PD
+    metrics_hc = {}
+    if len(all_labels_hc) > 0:
+        metrics_hc = calculate_metrics(all_labels_hc, all_preds_hc, task_name="HC vs PD", verbose=True)
+        metrics_hc['labels'] = all_labels_hc
+        metrics_hc['predictions'] = all_preds_hc
+        metrics_hc['probabilities'] = all_probs_hc
+
+    # Calculate metrics for PD vs DD
+    metrics_pd = {}
+    if len(all_labels_pd) > 0:
+        metrics_pd = calculate_metrics(all_labels_pd, all_preds_pd, task_name="PD vs DD", verbose=True)
+        metrics_pd['labels'] = all_labels_pd
+        metrics_pd['predictions'] = all_preds_pd
+        metrics_pd['probabilities'] = all_probs_pd
+
+    # Combine features and labels for visualization
+    if len(all_features) > 0:
+        all_features = np.concatenate(all_features, axis=0)
+        all_hc_pd_labels_viz = np.concatenate(all_hc_pd_labels_viz, axis=0)
+        all_pd_dd_labels_viz = np.concatenate(all_pd_dd_labels_viz, axis=0)
+    else:
+        all_features = None
+        all_hc_pd_labels_viz = None
+        all_pd_dd_labels_viz = None
+
+    return avg_loss, metrics_hc, metrics_pd, all_features, all_hc_pd_labels_viz, all_pd_dd_labels_viz
 
 def train_model(config):
-    
-    dataloader = ParkinsonsDatasetLoader(
+    """
+    Train model using k-fold cross-validation.
+    """
+    print("\n" + "="*80)
+    print("STARTING TRAINING WITH K-FOLD CROSS-VALIDATION")
+    print("="*80)
+
+    # Load full dataset
+    print("\nLoading dataset...")
+    full_dataset = ParkinsonsDatasetLoader(
         data_root=config['data_root'],
+        window_size=config['seq_len'],
+        max_windows_per_task=10,
+        min_windows_per_task=2,
         apply_downsampling=config['apply_downsampling'],
         apply_bandpass_filter=config['apply_bandpass_filter'],
-        apply_prepare_text=config['apply_prepare_text'],
-        split_type=config['split_type'],
-        split_ratio=config['split_ratio'],
-        train_tasks=config['train_tasks'],
-        num_folds=config['num_folds'],
-        window_size=256,
-        max_windows_per_task=100,
-        min_windows_per_task=5
+        apply_prepare_text=config['apply_prepare_text']
     )
-    
-    train_set , val_set = dataloader.get_train_val_split()
-    
-    train_loader = DataLoader(
-        train_set,
-        batch_size=config['batch_size'],
-        shuffle=True,
-        num_workers=config['num_workers'],
-        collate_fn=collate_fn
-    )
-    val_loader = DataLoader(   
-        val_set,
-        batch_size=config['batch_size'],
-        shuffle=False,
-        num_workers=config['num_workers'],
-        collate_fn=collate_fn
-    )
+
+    # Get k-fold splits
+    print(f"\nCreating {config['num_folds']}-fold cross-validation splits...")
+    fold_datasets = full_dataset.get_k_fold_split(k=config['num_folds'])
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MyModel(
-        input_dim=config['input_dim'],
-        model_dim=config['model_dim'],
-        num_heads=config['num_heads'],
-        num_window_layers=config['num_window_layers'],
-        num_task_layers=config['num_task_layers'],
-        d_ff=config['d_ff'],
-        dropout=config['dropout'],
-        seq_len=config['seq_len'],
-        use_text=config['use_text']
-    ).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config['learning_rate'],
-        weight_decay=config['weight_decay']
-    )
-    num_epochs = config['num_epochs']
-    for epoch in range(num_epochs):
-        train_loss = training_phase(model, train_loader, criterion, optimizer, device)
-        #calculate metrics, save csv , plot ruc and tsne 
-        val_loss, val_metrics_hc, val_metrics_pd = validation_phase(model, val_loader, criterion, device)
-        
-        print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {train_loss:.4f} - Val Loss: {val_loss:.4f}")
+    print(f"\nUsing device: {device}")
+
+    # Store results for all folds
+    all_fold_results = []
+
+    # Train on each fold
+    for fold_idx, (train_dataset, val_dataset) in enumerate(fold_datasets):
+        print("\n" + "="*80)
+        print(f"FOLD {fold_idx + 1}/{config['num_folds']}")
+        print("="*80)
+
+        # Create dataloaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config['batch_size'],
+            shuffle=True,
+            num_workers=config['num_workers'],
+            collate_fn=collate_fn
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config['batch_size'],
+            shuffle=False,
+            num_workers=config['num_workers'],
+            collate_fn=collate_fn
+        )
+
+        # Initialize model
+        model = MyModel(
+            input_dim=config['input_dim'],
+            model_dim=config['model_dim'],
+            num_heads=config['num_heads'],
+            num_window_layers=config['num_window_layers'],
+            num_task_layers=config['num_task_layers'],
+            d_ff=config['d_ff'],
+            dropout=config['dropout'],
+            seq_len=config['seq_len'],
+            use_text=config['use_text']
+        ).to(device)
+
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config['learning_rate'],
+            weight_decay=config['weight_decay']
+        )
+
+        # Track best model for this fold
+        best_val_acc = 0.0
+        best_epoch = 0
+        best_metrics_hc = {}
+        best_metrics_pd = {}
+        best_features = None
+        best_hc_labels = None
+        best_pd_labels = None
+
+        # Store metrics for each epoch
+        epoch_metrics_hc = []
+        epoch_metrics_pd = []
+
+        # Training loop
+        num_epochs = config['num_epochs']
+        for epoch in range(num_epochs):
+            print(f"\n--- Epoch {epoch+1}/{num_epochs} ---")
+
+            # Training phase
+            train_loss = training_phase(model, train_loader, criterion, optimizer, device)
+
+            # Validation phase
+            val_loss, val_metrics_hc, val_metrics_pd, features, hc_labels, pd_labels = validation_phase(
+                model, val_loader, criterion, device
+            )
+
+            # Calculate average accuracy across both tasks
+            acc_hc = val_metrics_hc.get('accuracy', 0) if val_metrics_hc else 0
+            acc_pd = val_metrics_pd.get('accuracy', 0) if val_metrics_pd else 0
+            avg_acc = (acc_hc + acc_pd) / 2
+
+            print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Avg Acc: {avg_acc:.4f}")
+
+            # Store metrics for this epoch
+            if val_metrics_hc:
+                epoch_metrics_hc.append({
+                    'epoch': epoch + 1,
+                    'metrics': {
+                        'accuracy': acc_hc,
+                        'precision': val_metrics_hc.get('precision_avg', 0),
+                        'recall': val_metrics_hc.get('recall_avg', 0),
+                        'f1': val_metrics_hc.get('f1_avg', 0)
+                    }
+                })
+
+            if val_metrics_pd:
+                epoch_metrics_pd.append({
+                    'epoch': epoch + 1,
+                    'metrics': {
+                        'accuracy': acc_pd,
+                        'precision': val_metrics_pd.get('precision_avg', 0),
+                        'recall': val_metrics_pd.get('recall_avg', 0),
+                        'f1': val_metrics_pd.get('f1_avg', 0)
+                    }
+                })
+
+            # Save best model
+            if avg_acc > best_val_acc:
+                best_val_acc = avg_acc
+                best_epoch = epoch + 1
+                best_metrics_hc = val_metrics_hc
+                best_metrics_pd = val_metrics_pd
+                best_features = features
+                best_hc_labels = hc_labels
+                best_pd_labels = pd_labels
+
+                # Save model checkpoint
+                os.makedirs("checkpoints", exist_ok=True)
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'fold': fold_idx,
+                    'accuracy': avg_acc
+                }, f"checkpoints/best_model_fold_{fold_idx+1}.pt")
+                print(f"✓ New best model saved (Acc: {best_val_acc:.4f})")
+
+        # Save metrics for this fold
+        print(f"\n--- Fold {fold_idx+1} Complete ---")
+        print(f"Best Epoch: {best_epoch} | Best Accuracy: {best_val_acc:.4f}")
+
+        if config['save_metrics']:
+            fold_suffix = f"_fold_{fold_idx+1}"
+            save_fold_metric(fold_idx, fold_suffix, best_epoch, best_val_acc,
+                           epoch_metrics_hc, epoch_metrics_pd)
+
+        # Create plots for best epoch
+        if config['create_plots']:
+            plot_dir = f"plots/fold_{fold_idx+1}"
+            os.makedirs(plot_dir, exist_ok=True)
+
+            # Plot ROC curves
+            if best_metrics_hc and 'labels' in best_metrics_hc:
+                plot_roc_curves(
+                    best_metrics_hc['labels'],
+                    best_metrics_hc['predictions'],
+                    best_metrics_hc['probabilities'],
+                    os.path.join(plot_dir, "roc_hc_vs_pd.png")
+                )
+                print(f"✓ ROC curve saved: {plot_dir}/roc_hc_vs_pd.png")
+
+            if best_metrics_pd and 'labels' in best_metrics_pd:
+                plot_roc_curves(
+                    best_metrics_pd['labels'],
+                    best_metrics_pd['predictions'],
+                    best_metrics_pd['probabilities'],
+                    os.path.join(plot_dir, "roc_pd_vs_dd.png")
+                )
+                print(f"✓ ROC curve saved: {plot_dir}/roc_pd_vs_dd.png")
+
+            # Plot t-SNE
+            if best_features is not None:
+                plot_tsne(best_features, best_hc_labels, best_pd_labels, output_dir=plot_dir)
+
+        # Store fold results
+        all_fold_results.append({
+            'fold': fold_idx + 1,
+            'best_epoch': best_epoch,
+            'best_accuracy': best_val_acc,
+            'metrics_hc': best_metrics_hc,
+            'metrics_pd': best_metrics_pd
+        })
+
+    # Print summary of all folds
+    print("\n" + "="*80)
+    print("CROSS-VALIDATION SUMMARY")
+    print("="*80)
+    for result in all_fold_results:
+        print(f"Fold {result['fold']}: Best Epoch={result['best_epoch']}, Accuracy={result['best_accuracy']:.4f}")
+
+    avg_accuracy = np.mean([r['best_accuracy'] for r in all_fold_results])
+    std_accuracy = np.std([r['best_accuracy'] for r in all_fold_results])
+    print(f"\nAverage Accuracy: {avg_accuracy:.4f} ± {std_accuracy:.4f}")
+
+    return all_fold_results
 
 def main():
     config = config()
