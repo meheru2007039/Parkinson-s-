@@ -52,7 +52,7 @@ def get_config():
         'num_workers': 0,
         'max_grad_norm': 1.0,  # Gradient clipping threshold (0 = no clipping)
         'use_auxiliary_loss': False,  # Enable if vanishing gradients detected (adds window-level supervision)
-        'label_smoothing': 0.2,  # Aggressive label smoothing to prevent majority class collapse
+        'label_smoothing': 0.1,  # Mild label smoothing (oversampling handles imbalance)
 
         'save_metrics': True,
         'create_plots': True,
@@ -1434,11 +1434,54 @@ def train_model(config):
         print(f"FOLD {fold_idx + 1}/{config['num_folds']}")
         print("="*80)
 
+        # ============ BALANCED OVERSAMPLING FOR CLASS IMBALANCE ============
+        print("\n" + "="*60)
+        print("CREATING BALANCED SAMPLER (OVERSAMPLING MINORITY CLASSES)")
+        print("="*60)
+
+        # Count class frequencies
+        hc_indices = [i for i, pt in enumerate(train_dataset.patient_data) if pt['hc_vs_pd'] == 0]
+        pd_indices = [i for i, pt in enumerate(train_dataset.patient_data) if pt['hc_vs_pd'] == 1 and pt['pd_vs_dd'] == 0]
+        dd_indices = [i for i, pt in enumerate(train_dataset.patient_data) if pt['pd_vs_dd'] == 1]
+
+        hc_count = len(hc_indices)
+        pd_count = len(pd_indices)
+        dd_count = len(dd_indices)
+
+        print(f"Original distribution: HC={hc_count}, PD={pd_count}, DD={dd_count}")
+
+        # Calculate weights for each sample (inverse of class frequency)
+        # We want to oversample minority classes so they appear as often as majority
+        max_count = max(hc_count, pd_count, dd_count)
+
+        sample_weights = torch.zeros(len(train_dataset.patient_data))
+        for i, pt in enumerate(train_dataset.patient_data):
+            if pt['hc_vs_pd'] == 0:  # HC
+                sample_weights[i] = max_count / hc_count
+            elif pt['hc_vs_pd'] == 1 and pt['pd_vs_dd'] == 0:  # PD
+                sample_weights[i] = max_count / pd_count
+            elif pt['pd_vs_dd'] == 1:  # DD
+                sample_weights[i] = max_count / dd_count
+
+        # Create weighted sampler
+        # This will sample patients with probability proportional to their weight
+        # Minority classes get higher weights, so they're sampled more often
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(train_dataset),
+            replacement=True  # Allow sampling same patient multiple times
+        )
+
+        print(f"Sample weights: HC={max_count/hc_count:.2f}x, PD={max_count/pd_count:.2f}x, DD={max_count/dd_count:.2f}x")
+        print(f"Expected samples per epoch: ~{max_count} from each class")
+        print("="*60 + "\n")
+        # ===================================================================
+
         # Create dataloaders
         train_loader = DataLoader(
             train_dataset,
             batch_size=config['batch_size'],
-            shuffle=True,
+            sampler=sampler,  # Use balanced sampler instead of shuffle
             num_workers=config['num_workers'],
             collate_fn=collate_fn
         )
@@ -1471,36 +1514,16 @@ def train_model(config):
         model.initialize_classifier_bias(train_dataset)
         print("="*60 + "\n")
 
-        # Compute class weights for handling imbalance
-        # Count labels in training data (now patient-level, not patient-task pairs)
-        train_hc_count = sum(1 for pt in train_dataset.patient_data if pt['hc_vs_pd'] == 0)
-        train_pd_count = sum(1 for pt in train_dataset.patient_data if pt['hc_vs_pd'] == 1)
-        train_dd_count = sum(1 for pt in train_dataset.patient_data if pt['pd_vs_dd'] == 1)
-
-        # Calculate inverse frequency weights
-        total_hc_pd = train_hc_count + train_pd_count
-        total_pd_dd = train_pd_count + train_dd_count
-
-        weight_hc_pd = torch.FloatTensor([
-            total_hc_pd / (2 * train_hc_count),
-            total_hc_pd / (2 * train_pd_count)
-        ]).to(device)
-
-        weight_pd_dd = torch.FloatTensor([
-            total_pd_dd / (2 * train_pd_count),
-            total_pd_dd / (2 * train_dd_count)
-        ]).to(device)
-
-        print(f"\n[Class Weighting] HC vs PD weights: HC={weight_hc_pd[0]:.3f}, PD={weight_hc_pd[1]:.3f}")
-        print(f"[Class Weighting] PD vs DD weights: PD={weight_pd_dd[0]:.3f}, DD={weight_pd_dd[1]:.3f}")
-
-        # Use weighted loss with label smoothing to prevent majority class collapse
+        # Loss functions - NO class weights needed since we balance via oversampling!
+        # Keep mild label smoothing to prevent overconfident predictions
         label_smoothing = config.get('label_smoothing', 0.0)
         if label_smoothing > 0:
-            print(f"[Label Smoothing] Using label_smoothing={label_smoothing} to prevent overconfident predictions")
+            print(f"\n[Label Smoothing] Using label_smoothing={label_smoothing}")
+        else:
+            print(f"\n[Loss] Using standard CrossEntropyLoss (no weights, no smoothing)")
 
-        criterion_hc = nn.CrossEntropyLoss(weight=weight_hc_pd, label_smoothing=label_smoothing)
-        criterion_pd = nn.CrossEntropyLoss(weight=weight_pd_dd, label_smoothing=label_smoothing)
+        criterion_hc = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        criterion_pd = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
         optimizer = torch.optim.AdamW(
             model.parameters(),
