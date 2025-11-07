@@ -51,6 +51,7 @@ def get_config():
         'num_epochs': 100,
         'num_workers': 0,
         'max_grad_norm': 1.0,  # Gradient clipping threshold (0 = no clipping)
+        'use_auxiliary_loss': False,  # Enable if vanishing gradients detected (adds window-level supervision)
 
         'save_metrics': True,
         'create_plots': True,
@@ -492,11 +493,13 @@ class MyModel(nn.Module):
         d_ff: int = 512,
         dropout: float = 0.1,
         seq_len: int = 256,
+        use_auxiliary_loss: bool = False,  # Add auxiliary loss at window level if vanishing gradients detected
     ):
         super().__init__()
 
         self.model_dim = model_dim
         self.seq_len = seq_len
+        self.use_auxiliary_loss = use_auxiliary_loss
 
         # ========== LEVEL 1: Window-Level Processing ==========
         self.left_projection = nn.Linear(input_dim, model_dim)
@@ -554,6 +557,23 @@ class MyModel(nn.Module):
             nn.Linear(model_dim, 2)  # Binary: PD vs DD
         )
 
+        # ========== Auxiliary Classification Heads (for vanishing gradient mitigation) ==========
+        # These operate directly on window features, providing shorter gradient path
+        if use_auxiliary_loss:
+            self.aux_head_hc_vs_pd = nn.Sequential(
+                nn.Linear(model_dim * 2, model_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(model_dim, 2)
+            )
+
+            self.aux_head_pd_vs_dd = nn.Sequential(
+                nn.Linear(model_dim * 2, model_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(model_dim, 2)
+            )
+
         self.dropout = nn.Dropout(dropout)
     
     
@@ -593,9 +613,19 @@ class MyModel(nn.Module):
         # ========== LEVEL 2: Task-Level Attention ==========
         # Reshape back to (batch, max_windows, model_dim*2)
         window_features = window_features.view(batch_size, max_windows, -1)
-        
+
+        # ========== Auxiliary Loss (if enabled) - Shorter Gradient Path ==========
+        # Compute auxiliary predictions directly from window features
+        aux_logits_hc = None
+        aux_logits_pd = None
+        if self.use_auxiliary_loss:
+            # Pool window features for auxiliary classification (simple average)
+            window_features_for_aux = window_features.mean(dim=1)  # (batch, model_dim*2)
+            aux_logits_hc = self.aux_head_hc_vs_pd(window_features_for_aux)
+            aux_logits_pd = self.aux_head_pd_vs_dd(window_features_for_aux)
+
         window_features = self.window_positional_encoding(window_features)
-        
+
         # Create attention mask for padding (invert the mask: True -> False for valid positions)
         key_padding_mask = ~batch['masks']  # (batch_size, max_windows)
         
@@ -624,8 +654,12 @@ class MyModel(nn.Module):
         # Using only signal features (no text)
         logits_hc_vs_pd = self.head_hc_vs_pd(task_representation)
         logits_pd_vs_dd = self.head_pd_vs_dd(task_representation)
-        
-        return logits_hc_vs_pd, logits_pd_vs_dd
+
+        # Return main logits and auxiliary logits (if enabled)
+        if self.use_auxiliary_loss:
+            return logits_hc_vs_pd, logits_pd_vs_dd, aux_logits_hc, aux_logits_pd
+        else:
+            return logits_hc_vs_pd, logits_pd_vs_dd
     
     
     def get_features(self, batch):
@@ -901,6 +935,127 @@ def check_gradients(model, log_prefix=""):
     return grad_stats
 
 
+def analyze_hierarchical_gradient_flow(model):
+    """
+    Detailed gradient flow analysis for hierarchical architecture.
+    Checks gradients at each level of the hierarchy.
+    """
+    print("\n" + "="*80)
+    print("HIERARCHICAL GRADIENT FLOW ANALYSIS")
+    print("="*80)
+
+    # Organize layers by hierarchy level
+    window_level_grads = []
+    task_level_grads = []
+    pooling_grads = []
+    classification_grads = []
+
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+
+        grad_norm = param.grad.data.norm(2).item()
+
+        # Categorize by hierarchy level
+        if 'window_layers' in name or 'left_projection' in name or 'right_projection' in name or 'positional_encoding' in name:
+            window_level_grads.append((name, grad_norm))
+        elif 'task_layers' in name or 'window_positional_encoding' in name:
+            task_level_grads.append((name, grad_norm))
+        elif 'task_attention_pooling' in name or 'global_pool' in name:
+            pooling_grads.append((name, grad_norm))
+        elif 'head_' in name:
+            classification_grads.append((name, grad_norm))
+
+    # Analyze each level
+    print("\n🔵 LEVEL 1: Window-Level Processing (deepest in hierarchy)")
+    print("-" * 80)
+    if window_level_grads:
+        avg_grad = sum(g for _, g in window_level_grads) / len(window_level_grads)
+        max_grad = max(g for _, g in window_level_grads)
+        min_grad = min(g for _, g in window_level_grads)
+        zero_count = sum(1 for _, g in window_level_grads if g < 1e-7)
+
+        print(f"Avg gradient: {avg_grad:.6f} | Max: {max_grad:.6f} | Min: {min_grad:.2e}")
+        print(f"Layers with near-zero gradients: {zero_count}/{len(window_level_grads)}")
+
+        if avg_grad < 1e-4:
+            print("🚨 CRITICAL: Window-level gradients are vanishing!")
+        elif avg_grad < 1e-3:
+            print("⚠️  WARNING: Window-level gradients are very small")
+        else:
+            print("✅ Window-level gradients look healthy")
+
+        # Show worst layers
+        worst_layers = sorted(window_level_grads, key=lambda x: x[1])[:3]
+        print("\nLayers with smallest gradients:")
+        for name, grad in worst_layers:
+            print(f"  {name}: {grad:.2e}")
+
+    print("\n🟢 LEVEL 2: Task-Level Processing")
+    print("-" * 80)
+    if task_level_grads:
+        avg_grad = sum(g for _, g in task_level_grads) / len(task_level_grads)
+        max_grad = max(g for _, g in task_level_grads)
+        min_grad = min(g for _, g in task_level_grads)
+
+        print(f"Avg gradient: {avg_grad:.6f} | Max: {max_grad:.6f} | Min: {min_grad:.2e}")
+
+        if avg_grad < 1e-4:
+            print("🚨 CRITICAL: Task-level gradients are vanishing!")
+        elif avg_grad < 1e-3:
+            print("⚠️  WARNING: Task-level gradients are very small")
+        else:
+            print("✅ Task-level gradients look healthy")
+
+    print("\n🟡 POOLING LAYERS (potential bottleneck)")
+    print("-" * 80)
+    if pooling_grads:
+        for name, grad in pooling_grads:
+            print(f"{name}: {grad:.6f}")
+            if grad < 1e-5:
+                print("  🚨 CRITICAL: Pooling layer blocking gradients!")
+
+    print("\n🟠 CLASSIFICATION HEADS (closest to loss)")
+    print("-" * 80)
+    if classification_grads:
+        avg_grad = sum(g for _, g in classification_grads) / len(classification_grads)
+        print(f"Avg gradient: {avg_grad:.6f}")
+
+        for name, grad in classification_grads:
+            print(f"  {name}: {grad:.6f}")
+
+    # Gradient flow ratio analysis
+    print("\n📊 GRADIENT FLOW RATIO ANALYSIS")
+    print("-" * 80)
+    if window_level_grads and classification_grads:
+        window_avg = sum(g for _, g in window_level_grads) / len(window_level_grads)
+        class_avg = sum(g for _, g in classification_grads) / len(classification_grads)
+        ratio = window_avg / (class_avg + 1e-10)
+
+        print(f"Window-to-Classification gradient ratio: {ratio:.6f}")
+        print(f"Window avg: {window_avg:.6f} | Classification avg: {class_avg:.6f}")
+
+        if ratio < 0.001:
+            print("🚨 SEVERE VANISHING: Window gradients are 1000x smaller than classification!")
+            print("   RECOMMENDATION: Enable auxiliary loss in config:")
+            print("   Set 'use_auxiliary_loss': True")
+            print("   This adds window-level supervision with shorter gradient path")
+        elif ratio < 0.01:
+            print("⚠️  MODERATE VANISHING: Window gradients are 100x smaller than classification")
+            print("   RECOMMENDATION: Consider one of:")
+            print("   1. Enable 'use_auxiliary_loss': True (adds window-level supervision)")
+            print("   2. Reduce 'num_window_layers' from 4 to 2-3")
+            print("   3. Increase learning rate slightly")
+        elif ratio < 0.1:
+            print("⚠️  MILD VANISHING: Window gradients are 10x smaller than classification")
+            print("   May be acceptable, but monitor training closely")
+            print("   If training stalls, enable 'use_auxiliary_loss': True")
+        else:
+            print("✅ Good gradient flow through hierarchy - no action needed!")
+
+    print("="*80 + "\n")
+
+
 # ============================================================================
 # Trainer
 # ============================================================================
@@ -940,7 +1095,12 @@ def training_phase(model, dataloader, criterion_hc, criterion_pd, optimizer, dev
                 for k, v in batch.items()}
 
         # Forward pass
-        logits_hc_vs_pd, logits_pd_vs_dd = model(batch)
+        model_outputs = model(batch)
+        if len(model_outputs) == 4:  # Auxiliary loss enabled
+            logits_hc_vs_pd, logits_pd_vs_dd, aux_logits_hc, aux_logits_pd = model_outputs
+        else:  # Standard forward pass
+            logits_hc_vs_pd, logits_pd_vs_dd = model_outputs
+            aux_logits_hc, aux_logits_pd = None, None
 
         # Calculate loss for HC vs PD (exclude -1 labels)
         valid_hc_mask = batch['hc_vs_pd'] != -1
@@ -949,12 +1109,24 @@ def training_phase(model, dataloader, criterion_hc, criterion_pd, optimizer, dev
             loss_hc = criterion_hc(logits_hc_vs_pd[valid_hc_mask],
                                batch['hc_vs_pd'][valid_hc_mask])
 
+            # Add auxiliary loss if enabled (weight it lower than main loss)
+            if aux_logits_hc is not None:
+                aux_loss_hc = criterion_hc(aux_logits_hc[valid_hc_mask],
+                                          batch['hc_vs_pd'][valid_hc_mask])
+                loss_hc = loss_hc + 0.4 * aux_loss_hc  # 40% weight for auxiliary
+
         # Calculate loss for PD vs DD (exclude -1 labels)
         valid_pd_mask = batch['pd_vs_dd'] != -1
         loss_pd = 0
         if valid_pd_mask.sum() > 0:
             loss_pd = criterion_pd(logits_pd_vs_dd[valid_pd_mask],
                                batch['pd_vs_dd'][valid_pd_mask])
+
+            # Add auxiliary loss if enabled
+            if aux_logits_pd is not None:
+                aux_loss_pd = criterion_pd(aux_logits_pd[valid_pd_mask],
+                                          batch['pd_vs_dd'][valid_pd_mask])
+                loss_pd = loss_pd + 0.4 * aux_loss_pd  # 40% weight for auxiliary
 
         # Combined loss
         loss = loss_hc + loss_pd
@@ -976,6 +1148,10 @@ def training_phase(model, dataloader, criterion_hc, criterion_pd, optimizer, dev
                 grad_stats = check_gradients(model, log_prefix=f"[Batch {batch_idx+1}] ")
                 print(f"[Batch {batch_idx+1}] Total grad norm: {grad_stats['total_norm']:.4f}, "
                       f"Max: {grad_stats['max_grad']:.4f}, Min: {grad_stats['min_grad']:.4e}")
+
+                # Detailed hierarchical analysis on first batch only
+                if batch_idx == 0:
+                    analyze_hierarchical_gradient_flow(model)
 
             # Gradient clipping (prevents exploding gradients)
             if max_grad_norm > 0:
@@ -1042,7 +1218,11 @@ def validation_phase(model, dataloader, criterion_hc, criterion_pd, device, debu
                     for k, v in batch.items()}
 
             # Forward pass
-            logits_hc_vs_pd, logits_pd_vs_dd = model(batch)
+            model_outputs = model(batch)
+            if len(model_outputs) == 4:  # Auxiliary loss enabled
+                logits_hc_vs_pd, logits_pd_vs_dd, _, _ = model_outputs
+            else:
+                logits_hc_vs_pd, logits_pd_vs_dd = model_outputs
 
             # Track patient IDs for debugging
             if debug_patient_ids and num_batches == 0:  # First batch only
@@ -1215,7 +1395,8 @@ def train_model(config):
             num_task_layers=config['num_task_layers'],
             d_ff=config['d_ff'],
             dropout=config['dropout'],
-            seq_len=config['seq_len']
+            seq_len=config['seq_len'],
+            use_auxiliary_loss=config.get('use_auxiliary_loss', False)
         ).to(device)
 
         # Compute class weights for handling imbalance (better than differential sampling)
