@@ -106,10 +106,10 @@ class ParkinsonsDatasetLoader(Dataset):
         self.apply_bandpass_filter = apply_bandpass_filter
         self.data_root = data_root
 
-        # Store patient-task combinations
-        # Each entry: {patient_id, task_name, left_windows, right_windows,
-        #              hc_vs_pd, pd_vs_dd, num_windows}
-        self.patient_task_data = []
+        # Store patient data with ALL tasks grouped together
+        # Each entry: {patient_id, tasks: [list of task dicts], hc_vs_pd, pd_vs_dd}
+        # where each task dict has: {task_name, left_windows, right_windows, num_windows}
+        self.patient_data = []
         
         if data_root is not None:
             self.patients_template = pathlib.Path(data_root) / "patients" / "patient_{p:03d}.json"
@@ -123,16 +123,16 @@ class ParkinsonsDatasetLoader(Dataset):
             
             self._load_data()
         elif patient_task_data is not None:
-            # For split datasets
-            self.patient_task_data = patient_task_data
+            # For split datasets - backward compatibility
+            self.patient_data = patient_task_data
 
-        print(f"Total patient-task combinations: {len(self.patient_task_data)}")
+        print(f"Total patients: {len(self.patient_data)}")
     
     
     def _load_data(self):
-        """Load data organized by patient-task combinations"""
-        
-        for patient_id in tqdm(self.patient_ids_list, desc="Loading patient-task data"):
+        """Load data organized by patient with ALL tasks grouped together"""
+
+        for patient_id in tqdm(self.patient_ids_list, desc="Loading patient data"):
             patient_path = pathlib.Path(str(self.patients_template).format(p=patient_id))
 
             if not patient_path.exists():
@@ -157,8 +157,11 @@ class ParkinsonsDatasetLoader(Dataset):
                     overlap = 0.65
                     hc_vs_pd_label = -1
                     pd_vs_dd_label = 1
-                
-                # Process each task separately
+
+                # Collect all tasks for this patient
+                patient_tasks = []
+
+                # Process each task and collect them
                 for task in self.tasks:
                     left_path = pathlib.Path(str(self.timeseries_template).format(
                         N=patient_id, X=task, Y="LeftWrist"))
@@ -207,22 +210,29 @@ class ParkinsonsDatasetLoader(Dataset):
                             if min_windows >= self.min_windows_per_task:
                                 # Limit to max_windows_per_task
                                 num_windows = min(min_windows, self.max_windows_per_task)
-                                
-                                # Store this patient-task combination
-                                self.patient_task_data.append({
-                                    'patient_id': patient_id,
+
+                                # Add this task to patient's task list
+                                patient_tasks.append({
                                     'task_name': task,
                                     'left_windows': left_windows[:num_windows],  # shape: (num_windows, 256, 6)
                                     'right_windows': right_windows[:num_windows], # shape: (num_windows, 256, 6)
-                                    'hc_vs_pd': hc_vs_pd_label,
-                                    'pd_vs_dd': pd_vs_dd_label,
                                     'num_windows': num_windows
                                 })
                     
                     except Exception as e:
                         print(f"Error loading patient {patient_id}, task {task}: {e}")
                         continue
-            
+
+                # After processing all tasks, add patient if they have at least one valid task
+                if len(patient_tasks) > 0:
+                    self.patient_data.append({
+                        'patient_id': patient_id,
+                        'tasks': patient_tasks,
+                        'hc_vs_pd': hc_vs_pd_label,
+                        'pd_vs_dd': pd_vs_dd_label,
+                        'num_tasks': len(patient_tasks)
+                    })
+
             except Exception as e:
                 print(f"Error loading patient {patient_id}: {e}")
                 continue
@@ -286,9 +296,9 @@ class ParkinsonsDatasetLoader(Dataset):
             print(f"   Test patients:  {len(test_patients)} (IDs: {sorted(list(test_patients))[:5]}...)")
             # ============================================
 
-            # Split patient-task data
-            train_data = [pt for pt in self.patient_task_data if pt['patient_id'] in train_patients]
-            test_data = [pt for pt in self.patient_task_data if pt['patient_id'] in test_patients]
+            # Split patient data
+            train_data = [pt for pt in self.patient_data if pt['patient_id'] in train_patients]
+            test_data = [pt for pt in self.patient_data if pt['patient_id'] in test_patients]
             
             # Create datasets
             train_dataset = ParkinsonsDatasetLoader(
@@ -314,10 +324,10 @@ class ParkinsonsDatasetLoader(Dataset):
             test_hc = sum(1 for pt in test_data if pt['hc_vs_pd'] == 0)
             test_pd = sum(1 for pt in test_data if pt['hc_vs_pd'] == 1 and pt['pd_vs_dd'] == 0)
             test_dd = sum(1 for pt in test_data if pt['pd_vs_dd'] == 1)
-            
+
             print(f"\nFold {fold_id+1}/{k}:")
-            print(f"  Train: {len(train_data)} patient-task pairs (HC={train_hc}, PD={train_pd}, DD={train_dd})")
-            print(f"  Test:  {len(test_data)} patient-task pairs (HC={test_hc}, PD={test_pd}, DD={test_dd})")
+            print(f"  Train: {len(train_data)} patients (HC={train_hc}, PD={train_pd}, DD={train_dd})")
+            print(f"  Test:  {len(test_data)} patients (HC={test_hc}, PD={test_pd}, DD={test_dd})")
             
             fold_datasets.append((train_dataset, test_dataset))
         
@@ -325,29 +335,29 @@ class ParkinsonsDatasetLoader(Dataset):
     
     
     def __len__(self):
-        return len(self.patient_task_data)
-    
-    
-    def __getitem__(self, idx):
-        """Returns ONE patient-task combination with ALL its windows."""
-        pt_data = self.patient_task_data[idx]
+        return len(self.patient_data)
 
-        left_windows = torch.FloatTensor(pt_data['left_windows'])   # (num_windows, 256, 6)
-        right_windows = torch.FloatTensor(pt_data['right_windows']) # (num_windows, 256, 6)
-        hc_vs_pd = torch.LongTensor([pt_data['hc_vs_pd']])
-        pd_vs_dd = torch.LongTensor([pt_data['pd_vs_dd']])
-        num_windows = pt_data['num_windows']
-        patient_id = pt_data['patient_id']
-        task_name = pt_data['task_name']
+
+    def __getitem__(self, idx):
+        """Returns ONE patient with ALL their tasks."""
+        patient = self.patient_data[idx]
+
+        # Convert all task windows to tensors
+        tasks_data = []
+        for task in patient['tasks']:
+            tasks_data.append({
+                'task_name': task['task_name'],
+                'left_windows': torch.FloatTensor(task['left_windows']),   # (num_windows, 256, 6)
+                'right_windows': torch.FloatTensor(task['right_windows']), # (num_windows, 256, 6)
+                'num_windows': task['num_windows']
+            })
 
         return {
-            'left_windows': left_windows,
-            'right_windows': right_windows,
-            'hc_vs_pd': hc_vs_pd.squeeze(),
-            'pd_vs_dd': pd_vs_dd.squeeze(),
-            'num_windows': num_windows,
-            'patient_id': patient_id,
-            'task_name': task_name
+            'patient_id': patient['patient_id'],
+            'tasks': tasks_data,
+            'num_tasks': patient['num_tasks'],
+            'hc_vs_pd': patient['hc_vs_pd'],
+            'pd_vs_dd': patient['pd_vs_dd']
         }
 
 
@@ -356,48 +366,56 @@ class ParkinsonsDatasetLoader(Dataset):
 # ============================================================================
 def collate_fn(batch):
     """
-    Collate function to handle variable number of windows per task.
-    Pads to max_windows in the batch.
+    Collate function to handle variable number of tasks per patient and windows per task.
+    Pads to max_tasks and max_windows in the batch.
+    Structure: batch_size x max_tasks x max_windows x 256 x 6
     """
-    # Find max windows in this batch
-    max_windows = max([item['num_windows'] for item in batch])
-    
     batch_size = len(batch)
-    
+
+    # Find max tasks and max windows across all patients in batch
+    max_tasks = max([patient['num_tasks'] for patient in batch])
+    max_windows = max([
+        max([task['num_windows'] for task in patient['tasks']])
+        for patient in batch
+    ])
+
     # Initialize padded tensors
-    left_windows_padded = torch.zeros(batch_size, max_windows, 256, 6)
-    right_windows_padded = torch.zeros(batch_size, max_windows, 256, 6)
-    masks = torch.zeros(batch_size, max_windows, dtype=torch.bool)  # True for valid windows
-    
+    # Shape: (batch_size, max_tasks, max_windows, 256, 6)
+    left_windows_padded = torch.zeros(batch_size, max_tasks, max_windows, 256, 6)
+    right_windows_padded = torch.zeros(batch_size, max_tasks, max_windows, 256, 6)
+
+    # Masks: True for valid positions
+    task_masks = torch.zeros(batch_size, max_tasks, dtype=torch.bool)     # Valid tasks
+    window_masks = torch.zeros(batch_size, max_tasks, max_windows, dtype=torch.bool)  # Valid windows
+
     hc_vs_pd_labels = []
     pd_vs_dd_labels = []
-    num_windows_list = []
     patient_ids = []
-    task_names = []
 
-    for i, item in enumerate(batch):
-        num_win = item['num_windows']
+    for i, patient in enumerate(batch):
+        num_tasks = patient['num_tasks']
+        task_masks[i, :num_tasks] = True
 
-        # Copy actual data
-        left_windows_padded[i, :num_win] = item['left_windows']
-        right_windows_padded[i, :num_win] = item['right_windows']
-        masks[i, :num_win] = True
+        for j, task in enumerate(patient['tasks']):
+            num_windows = task['num_windows']
 
-        hc_vs_pd_labels.append(item['hc_vs_pd'])
-        pd_vs_dd_labels.append(item['pd_vs_dd'])
-        num_windows_list.append(num_win)
-        patient_ids.append(item['patient_id'])
-        task_names.append(item['task_name'])
+            # Copy actual window data
+            left_windows_padded[i, j, :num_windows] = task['left_windows']
+            right_windows_padded[i, j, :num_windows] = task['right_windows']
+            window_masks[i, j, :num_windows] = True
+
+        hc_vs_pd_labels.append(patient['hc_vs_pd'])
+        pd_vs_dd_labels.append(patient['pd_vs_dd'])
+        patient_ids.append(patient['patient_id'])
 
     return {
-        'left_windows': left_windows_padded,
-        'right_windows': right_windows_padded,
-        'masks': masks,
-        'hc_vs_pd': torch.stack(hc_vs_pd_labels),
-        'pd_vs_dd': torch.stack(pd_vs_dd_labels),
-        'num_windows': num_windows_list,
-        'patient_ids': patient_ids,
-        'task_names': task_names
+        'left_windows': left_windows_padded,      # (batch, max_tasks, max_windows, 256, 6)
+        'right_windows': right_windows_padded,    # (batch, max_tasks, max_windows, 256, 6)
+        'task_masks': task_masks,                  # (batch, max_tasks)
+        'window_masks': window_masks,              # (batch, max_tasks, max_windows)
+        'hc_vs_pd': torch.LongTensor(hc_vs_pd_labels),
+        'pd_vs_dd': torch.LongTensor(pd_vs_dd_labels),
+        'patient_ids': patient_ids
     }
 
 # ============================================================================
@@ -576,19 +594,24 @@ class MyModel(nn.Module):
     
     
     def forward(self, batch):
-       
+        """
+        Forward pass for hierarchical model.
+        Input: batch_size x max_tasks x max_windows x 256 x 6
+        Output: batch_size x num_classes
+        """
         device = batch['left_windows'].device
         batch_size = batch['left_windows'].shape[0]
-        max_windows = batch['left_windows'].shape[1]
-        
-        # ========== LEVEL 1: Window-Level Cross-Attention ==========
-        # Reshape: (batch, max_windows, 256, 6) -> (batch * max_windows, 256, 6)
+        max_tasks = batch['left_windows'].shape[1]
+        max_windows = batch['left_windows'].shape[2]
+
+        # ========== LEVEL 1: Window-Level Cross-Attention (within each task) ==========
+        # Reshape: (batch, max_tasks, max_windows, 256, 6) -> (batch * max_tasks * max_windows, 256, 6)
         left_windows_flat = batch['left_windows'].view(-1, self.seq_len, 6)
         right_windows_flat = batch['right_windows'].view(-1, self.seq_len, 6)
         
         # Project to model dimension
-        left_encoded = self.left_projection(left_windows_flat)   # (batch*max_windows, 256, model_dim)
-        right_encoded = self.right_projection(right_windows_flat) 
+        left_encoded = self.left_projection(left_windows_flat)   # (batch*max_tasks*max_windows, 256, model_dim)
+        right_encoded = self.right_projection(right_windows_flat)  # (batch*max_tasks*max_windows, 256, model_dim) 
         
         # Add positional encoding
         left_encoded = self.positional_encoding(left_encoded)
@@ -602,78 +625,88 @@ class MyModel(nn.Module):
             left_encoded, right_encoded = layer(left_encoded, right_encoded)
         
         # Global pooling for each window
-        left_pool = self.global_pool(left_encoded.transpose(1, 2)).squeeze(-1)  # (batch*max_windows, model_dim)
-        right_pool = self.global_pool(right_encoded.transpose(1, 2)).squeeze(-1) # (batch*max_windows, model_dim)
-        
+        left_pool = self.global_pool(left_encoded.transpose(1, 2)).squeeze(-1)  # (batch*max_tasks*max_windows, model_dim)
+        right_pool = self.global_pool(right_encoded.transpose(1, 2)).squeeze(-1) # (batch*max_tasks*max_windows, model_dim)
+
         # Concatenate left and right features
-        window_features = torch.cat([left_pool, right_pool], dim=1)  # (batch*max_windows, model_dim*2)
-        
-        # ========== LEVEL 2: Task-Level Attention ==========
-        # Reshape back to (batch, max_windows, model_dim*2)
-        window_features = window_features.view(batch_size, max_windows, -1)
+        window_features = torch.cat([left_pool, right_pool], dim=1)  # (batch*max_tasks*max_windows, model_dim*2)
 
-        # Shuffle windows to prevent learning from serial order
-        if self.training:
-            # Create random permutation for each sample in batch
-            shuffled_features = []
-            shuffled_masks = []
-            for i in range(batch_size):
-                # Get number of valid windows for this sample
-                num_valid = batch['masks'][i].sum().item()
+        # Reshape to (batch, max_tasks, max_windows, model_dim*2)
+        window_features = window_features.view(batch_size, max_tasks, max_windows, -1)
 
-                # Create permutation indices
-                perm = torch.randperm(max_windows, device=window_features.device)
+        # ========== LEVEL 1.5: Aggregate windows within each task ==========
+        # For each task, aggregate its windows using attention
+        task_features_list = []
 
-                # Shuffle window features and mask
-                shuffled_features.append(window_features[i][perm].unsqueeze(0))
-                shuffled_masks.append(batch['masks'][i][perm].unsqueeze(0))
+        for task_idx in range(max_tasks):
+            task_windows = window_features[:, task_idx, :, :]  # (batch, max_windows, model_dim*2)
+            task_window_mask = batch['window_masks'][:, task_idx, :]  # (batch, max_windows)
 
-            window_features = torch.cat(shuffled_features, dim=0)
-            batch['masks'] = torch.cat(shuffled_masks, dim=0)
+            # Shuffle windows within this task to prevent learning from serial order
+            if self.training:
+                shuffled_task_windows = []
+                shuffled_task_masks = []
+                for i in range(batch_size):
+                    perm = torch.randperm(max_windows, device=window_features.device)
+                    shuffled_task_windows.append(task_windows[i][perm].unsqueeze(0))
+                    shuffled_task_masks.append(task_window_mask[i][perm].unsqueeze(0))
+                task_windows = torch.cat(shuffled_task_windows, dim=0)
+                task_window_mask = torch.cat(shuffled_task_masks, dim=0)
 
-        # ========== Auxiliary Loss (if enabled) - Shorter Gradient Path ==========
-        # Compute auxiliary predictions directly from window features
-        aux_logits_hc = None
-        aux_logits_pd = None
-        if self.use_auxiliary_loss:
-            # Pool window features for auxiliary classification (simple average)
-            window_features_for_aux = window_features.mean(dim=1)  # (batch, model_dim*2)
-            aux_logits_hc = self.aux_head_hc_vs_pd(window_features_for_aux)
-            aux_logits_pd = self.aux_head_pd_vs_dd(window_features_for_aux)
+            # Apply attention pooling to aggregate windows for this task
+            task_windows_with_pe = self.window_positional_encoding(task_windows)
 
-        window_features = self.window_positional_encoding(window_features)
+            # Attention scores for window aggregation
+            attention_scores = self.task_attention_pooling(task_windows_with_pe)  # (batch, max_windows, 1)
+            attention_scores = attention_scores.masked_fill(~task_window_mask.unsqueeze(-1), float('-inf'))
+            attention_weights = F.softmax(attention_scores, dim=1)
 
-        # Create attention mask for padding (invert the mask: True -> False for valid positions)
-        key_padding_mask = ~batch['masks']  # (batch_size, max_windows)
-        
+            # Aggregate windows → single task representation
+            task_repr = (task_windows * attention_weights).sum(dim=1)  # (batch, model_dim*2)
+            task_features_list.append(task_repr)
+
+        # Stack all task representations: (batch, max_tasks, model_dim*2)
+        task_features = torch.stack(task_features_list, dim=1)
+
+        # ========== LEVEL 2: Aggregate across tasks per patient ==========
+
+        # Apply self-attention across tasks
+        task_mask = ~batch['task_masks']  # (batch, max_tasks) - True for padding
+
         # Apply task-level self-attention layers
-        task_features = window_features
         for task_layer in self.task_layers:
             attn_output, _ = task_layer['self_attention'](
                 query=task_features,
                 key=task_features,
                 value=task_features,
-                key_padding_mask=key_padding_mask
+                key_padding_mask=task_mask
             )
             task_features = task_layer['norm'](task_features + attn_output)
             task_features = task_layer['feed_forward'](task_features)
-        
-        # Attention-based pooling to get task representation
-        attention_scores = self.task_attention_pooling(task_features)  # (batch, max_windows, 1)
 
-        # Mask BEFORE softmax (set padding positions to -inf so they get weight 0)
-        attention_scores = attention_scores.masked_fill(key_padding_mask.unsqueeze(-1), float('-inf'))
+        # ========== Auxiliary Loss (if enabled) - Shorter Gradient Path ==========
+        aux_logits_hc = None
+        aux_logits_pd = None
+        if self.use_auxiliary_loss:
+            # Pool task features for auxiliary classification (simple average over valid tasks)
+            valid_task_mask = batch['task_masks'].float().unsqueeze(-1)  # (batch, max_tasks, 1)
+            num_valid_tasks = valid_task_mask.sum(dim=1, keepdim=True).clamp(min=1)
+            task_features_for_aux = (task_features * valid_task_mask).sum(dim=1) / num_valid_tasks.squeeze(-1)  # (batch, model_dim*2)
+            aux_logits_hc = self.aux_head_hc_vs_pd(task_features_for_aux)
+            aux_logits_pd = self.aux_head_pd_vs_dd(task_features_for_aux)
 
-        # Apply softmax to get normalized attention weights
-        attention_weights = F.softmax(attention_scores, dim=1)  # (batch, max_windows, 1)
+        # Final attention pooling across tasks → patient representation
+        attention_scores = self.task_attention_pooling(task_features)  # (batch, max_tasks, 1)
+        attention_scores = attention_scores.masked_fill(task_mask.unsqueeze(-1), float('-inf'))
+        attention_weights = F.softmax(attention_scores, dim=1)  # (batch, max_tasks, 1)
 
-        # Weighted sum of task features
-        task_representation = (task_features * attention_weights).sum(dim=1)  # (batch, model_dim*2)
+        # Weighted sum of task features → patient representation
+        patient_representation = (task_features * attention_weights).sum(dim=1)  # (batch, model_dim*2)
 
         # ========== Classification ==========
-        # Using only signal features (no text)
-        logits_hc_vs_pd = self.head_hc_vs_pd(task_representation)
-        logits_pd_vs_dd = self.head_pd_vs_dd(task_representation)
+        # Using patient representation aggregated from all tasks
+        logits_hc_vs_pd = self.head_hc_vs_pd(patient_representation)
+        logits_pd_vs_dd = self.head_pd_vs_dd(patient_representation)
 
         # Return main logits and auxiliary logits (if enabled)
         if self.use_auxiliary_loss:
@@ -683,60 +716,24 @@ class MyModel(nn.Module):
     
     
     def get_features(self, batch):
-        """Extract features for tsne plot"""
-        device = batch['left_windows'].device
-        batch_size = batch['left_windows'].shape[0]
-        max_windows = batch['left_windows'].shape[1]
-        
-        # Level 1: Window processing
-        left_windows_flat = batch['left_windows'].view(-1, self.seq_len, 6)
-        right_windows_flat = batch['right_windows'].view(-1, self.seq_len, 6)
-        
-        left_encoded = self.left_projection(left_windows_flat)
-        right_encoded = self.right_projection(right_windows_flat)
-        
-        left_encoded = self.positional_encoding(left_encoded)
-        right_encoded = self.positional_encoding(right_encoded)
-        
-        left_encoded = self.dropout(left_encoded)
-        right_encoded = self.dropout(right_encoded)
-        
-        for layer in self.window_layers:
-            left_encoded, right_encoded = layer(left_encoded, right_encoded)
-        
-        left_pool = self.global_pool(left_encoded.transpose(1, 2)).squeeze(-1)
-        right_pool = self.global_pool(right_encoded.transpose(1, 2)).squeeze(-1)
-        
-        window_features = torch.cat([left_pool, right_pool], dim=1)
-        window_features = window_features.view(batch_size, max_windows, -1)
-        
-        # Level 2: Task processing
-        window_features = self.window_positional_encoding(window_features)
-        key_padding_mask = ~batch['masks']
-        
-        task_features = window_features
-        for task_layer in self.task_layers:
-            attn_output, _ = task_layer['self_attention'](
-                query=task_features,
-                key=task_features,
-                value=task_features,
-                key_padding_mask=key_padding_mask
-            )
-            task_features = task_layer['norm'](task_features + attn_output)
-            task_features = task_layer['feed_forward'](task_features)
-        
-        # Fixed attention pooling: mask before softmax, no double normalization
-        attention_scores = self.task_attention_pooling(task_features)
-        attention_scores = attention_scores.masked_fill(key_padding_mask.unsqueeze(-1), float('-inf'))
-        attention_weights = F.softmax(attention_scores, dim=1)
-        task_representation = (task_features * attention_weights).sum(dim=1)
+        """
+        Extract patient-level features for visualization (e.g., t-SNE).
+        Uses forward pass without gradients.
+        """
+        with torch.no_grad():
+            # Run forward pass
+            if self.use_auxiliary_loss:
+                logits_hc, logits_pd, aux_hc, aux_pd = self.forward(batch)
+            else:
+                logits_hc, logits_pd = self.forward(batch)
 
-        return {
-            'window_features': window_features,  # (batch, max_windows, model_dim*2)
-            'task_representation': task_representation,  # (batch, model_dim*2)
-            'fused_features': task_representation,  # (batch, model_dim*2) - no text, just signal features
-            'attention_weights': attention_weights.squeeze(-1)  # (batch, max_windows)
-        }
+            # Return logits as features for visualization
+            # These represent the patient-level representation after aggregating all tasks
+            return {
+                'patient_features': torch.cat([logits_hc, logits_pd], dim=1),  # (batch, 4) - concatenated logits
+                'logits_hc_vs_pd': logits_hc,  # (batch, 2)
+                'logits_pd_vs_dd': logits_pd   # (batch, 2)
+            }
 # ============================================================================
 # Evaluation functions
 # ============================================================================
@@ -1432,11 +1429,11 @@ def train_model(config):
             use_auxiliary_loss=config.get('use_auxiliary_loss', False)
         ).to(device)
 
-        # Compute class weights for handling imbalance (better than differential sampling)
-        # Count labels in training data
-        train_hc_count = sum(1 for pt in train_dataset.patient_task_data if pt['hc_vs_pd'] == 0)
-        train_pd_count = sum(1 for pt in train_dataset.patient_task_data if pt['hc_vs_pd'] == 1)
-        train_dd_count = sum(1 for pt in train_dataset.patient_task_data if pt['pd_vs_dd'] == 1)
+        # Compute class weights for handling imbalance
+        # Count labels in training data (now patient-level, not patient-task pairs)
+        train_hc_count = sum(1 for pt in train_dataset.patient_data if pt['hc_vs_pd'] == 0)
+        train_pd_count = sum(1 for pt in train_dataset.patient_data if pt['hc_vs_pd'] == 1)
+        train_dd_count = sum(1 for pt in train_dataset.patient_data if pt['pd_vs_dd'] == 1)
 
         # Calculate inverse frequency weights
         total_hc_pd = train_hc_count + train_pd_count
