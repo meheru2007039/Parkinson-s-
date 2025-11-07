@@ -31,7 +31,7 @@ def get_config():
         'split_ratio': 0.85,
         'train_tasks': None,
         'num_folds': 5,
-        
+
         'input_dim': 6,
         'model_dim': 64,
         'num_heads': 8,
@@ -43,14 +43,15 @@ def get_config():
         'seq_len': 256,
         'num_classes': 2,
         'use_text': False,
-        
+
         'batch_size': 8,  # Actual batch size in memory
         'gradient_accumulation_steps': 8,  # Effective batch size = 8 * 8 = 64
         'learning_rate': 0.0005,
         'weight_decay': 0.01,
         'num_epochs': 100,
         'num_workers': 0,
-        
+        'max_grad_norm': 1.0,  # Gradient clipping threshold (0 = no clipping)
+
         'save_metrics': True,
         'create_plots': True,
     }
@@ -850,12 +851,62 @@ def plot_tsne(features, hc_pd_labels, pd_dd_labels, output_dir="plots"):
     return features_2d
 
 
+# ============================================================================
+# Gradient Monitoring Utilities
+# ============================================================================
+def check_gradients(model, log_prefix=""):
+    """
+    Check for gradient vanishing/exploding issues.
+    Returns dict with gradient statistics.
+    """
+    total_norm = 0.0
+    grad_stats = {
+        'layer_norms': [],
+        'layer_names': [],
+        'max_grad': 0.0,
+        'min_grad': float('inf'),
+        'num_zero_grads': 0,
+        'num_nan_grads': 0
+    }
+
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            param_norm = param.grad.data.norm(2).item()
+            total_norm += param_norm ** 2
+
+            grad_stats['layer_names'].append(name)
+            grad_stats['layer_norms'].append(param_norm)
+            grad_stats['max_grad'] = max(grad_stats['max_grad'], param_norm)
+            grad_stats['min_grad'] = min(grad_stats['min_grad'], param_norm)
+
+            if param_norm < 1e-7:
+                grad_stats['num_zero_grads'] += 1
+            if torch.isnan(param.grad).any():
+                grad_stats['num_nan_grads'] += 1
+
+    grad_stats['total_norm'] = total_norm ** 0.5
+
+    # Check for issues
+    if grad_stats['total_norm'] < 1e-5:
+        print(f"{log_prefix}⚠️  WARNING: Very small gradient norm ({grad_stats['total_norm']:.2e}) - possible vanishing gradients!")
+    elif grad_stats['total_norm'] > 100:
+        print(f"{log_prefix}⚠️  WARNING: Very large gradient norm ({grad_stats['total_norm']:.2e}) - possible exploding gradients!")
+
+    if grad_stats['num_zero_grads'] > len(grad_stats['layer_names']) * 0.3:
+        print(f"{log_prefix}⚠️  WARNING: {grad_stats['num_zero_grads']}/{len(grad_stats['layer_names'])} layers have near-zero gradients!")
+
+    if grad_stats['num_nan_grads'] > 0:
+        print(f"{log_prefix}🚨 ERROR: {grad_stats['num_nan_grads']} layers have NaN gradients!")
+
+    return grad_stats
+
 
 # ============================================================================
 # Trainer
 # ============================================================================
 
-def training_phase(model, dataloader, criterion_hc, criterion_pd, optimizer, device, gradient_accumulation_steps=1):
+def training_phase(model, dataloader, criterion_hc, criterion_pd, optimizer, device, gradient_accumulation_steps=1,
+                   check_grads=False, max_grad_norm=1.0):
     """
     Training phase for one epoch with gradient accumulation.
 
@@ -867,6 +918,8 @@ def training_phase(model, dataloader, criterion_hc, criterion_pd, optimizer, dev
         optimizer: Optimizer
         device: Device to train on
         gradient_accumulation_steps: Number of steps to accumulate gradients before updating
+        check_grads: Whether to check gradient statistics (for debugging)
+        max_grad_norm: Maximum gradient norm for clipping (0 = no clipping)
 
     Returns:
         Average training loss for the epoch
@@ -918,6 +971,16 @@ def training_phase(model, dataloader, criterion_hc, criterion_pd, optimizer, dev
 
         # Update weights every gradient_accumulation_steps
         if (batch_idx + 1) % gradient_accumulation_steps == 0:
+            # Check gradients on first few batches (debugging)
+            if check_grads and batch_idx < 3:
+                grad_stats = check_gradients(model, log_prefix=f"[Batch {batch_idx+1}] ")
+                print(f"[Batch {batch_idx+1}] Total grad norm: {grad_stats['total_norm']:.4f}, "
+                      f"Max: {grad_stats['max_grad']:.4f}, Min: {grad_stats['min_grad']:.4e}")
+
+            # Gradient clipping (prevents exploding gradients)
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
             optimizer.step()
             optimizer.zero_grad()
 
@@ -934,6 +997,10 @@ def training_phase(model, dataloader, criterion_hc, criterion_pd, optimizer, dev
 
     # Update for any remaining accumulated gradients
     if num_batches % gradient_accumulation_steps != 0:
+        # Gradient clipping
+        if max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
         optimizer.step()
         optimizer.zero_grad()
 
@@ -1227,10 +1294,12 @@ def train_model(config):
         for epoch in range(num_epochs):
             print(f"\n--- Epoch {epoch+1}/{num_epochs} ---")
 
-            # Training phase
+            # Training phase (check gradients on first epoch for debugging)
             train_loss = training_phase(
                 model, train_loader, criterion_hc, criterion_pd, optimizer, device,
-                gradient_accumulation_steps=config['gradient_accumulation_steps']
+                gradient_accumulation_steps=config['gradient_accumulation_steps'],
+                check_grads=(epoch == 0 and fold_idx == 0),  # Only first epoch of first fold
+                max_grad_norm=config.get('max_grad_norm', 1.0)
             )
 
             # Validation phase (debug patient IDs on first epoch)
