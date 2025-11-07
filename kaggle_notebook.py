@@ -1143,14 +1143,16 @@ def training_phase(model, dataloader, criterion_hc, criterion_pd, optimizer, dev
 
         # Update weights every gradient_accumulation_steps
         if (batch_idx + 1) % gradient_accumulation_steps == 0:
-            # Check gradients on first few batches (debugging)
-            if check_grads and batch_idx < 3:
-                grad_stats = check_gradients(model, log_prefix=f"[Batch {batch_idx+1}] ")
-                print(f"[Batch {batch_idx+1}] Total grad norm: {grad_stats['total_norm']:.4f}, "
+            effective_batch = (batch_idx + 1) // gradient_accumulation_steps
+
+            # Check gradients on first few effective batches (debugging)
+            if check_grads and effective_batch <= 3:
+                grad_stats = check_gradients(model, log_prefix=f"[Effective Batch {effective_batch}] ")
+                print(f"\n[Effective Batch {effective_batch}] Total grad norm: {grad_stats['total_norm']:.4f}, "
                       f"Max: {grad_stats['max_grad']:.4f}, Min: {grad_stats['min_grad']:.4e}")
 
-                # Detailed hierarchical analysis on first batch only
-                if batch_idx == 0:
+                # Detailed hierarchical analysis on first effective batch only
+                if effective_batch == 1:
                     analyze_hierarchical_gradient_flow(model)
 
             # Gradient clipping (prevents exploding gradients)
