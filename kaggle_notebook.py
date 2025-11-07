@@ -144,18 +144,17 @@ class ParkinsonsDatasetLoader(Dataset):
 
                 condition = metadata.get('condition', '')
 
-                # Determine labels
-                # UNIFORM overlap to prevent num_windows leakage
-                # Different overlaps create different window counts which leak labels!
-                overlap = 0.5
-
+                # Determine labels and differential overlapping
                 if condition == 'Healthy':
+                    overlap = 0.70
                     hc_vs_pd_label = 0
                     pd_vs_dd_label = -1
                 elif 'Parkinson' in condition:
+                    overlap = 0.0
                     hc_vs_pd_label = 1
                     pd_vs_dd_label = 0
                 else:
+                    overlap = 0.65
                     hc_vs_pd_label = -1
                     pd_vs_dd_label = 1
                 
@@ -612,6 +611,25 @@ class MyModel(nn.Module):
         # ========== LEVEL 2: Task-Level Attention ==========
         # Reshape back to (batch, max_windows, model_dim*2)
         window_features = window_features.view(batch_size, max_windows, -1)
+
+        # Shuffle windows to prevent learning from serial order
+        if self.training:
+            # Create random permutation for each sample in batch
+            shuffled_features = []
+            shuffled_masks = []
+            for i in range(batch_size):
+                # Get number of valid windows for this sample
+                num_valid = batch['masks'][i].sum().item()
+
+                # Create permutation indices
+                perm = torch.randperm(max_windows, device=window_features.device)
+
+                # Shuffle window features and mask
+                shuffled_features.append(window_features[i][perm].unsqueeze(0))
+                shuffled_masks.append(batch['masks'][i][perm].unsqueeze(0))
+
+            window_features = torch.cat(shuffled_features, dim=0)
+            batch['masks'] = torch.cat(shuffled_masks, dim=0)
 
         # ========== Auxiliary Loss (if enabled) - Shorter Gradient Path ==========
         # Compute auxiliary predictions directly from window features
