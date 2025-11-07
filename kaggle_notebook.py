@@ -52,7 +52,7 @@ def get_config():
         'num_workers': 0,
         'max_grad_norm': 1.0,  # Gradient clipping threshold (0 = no clipping)
         'use_auxiliary_loss': False,  # Enable if vanishing gradients detected (adds window-level supervision)
-        'label_smoothing': 0.1,  # Add label smoothing to prevent overconfident predictions
+        'label_smoothing': 0.2,  # Aggressive label smoothing to prevent majority class collapse
 
         'save_metrics': True,
         'create_plots': True,
@@ -591,8 +591,41 @@ class MyModel(nn.Module):
             )
 
         self.dropout = nn.Dropout(dropout)
-    
-    
+
+    def initialize_classifier_bias(self, train_dataset):
+        """
+        Initialize classification head biases based on class frequencies.
+        This gives minority classes a better starting point.
+        """
+        # Count class frequencies in training data
+        hc_count = sum(1 for pt in train_dataset.patient_data if pt['hc_vs_pd'] == 0)
+        pd_count = sum(1 for pt in train_dataset.patient_data if pt['hc_vs_pd'] == 1)
+        dd_count = sum(1 for pt in train_dataset.patient_data if pt['pd_vs_dd'] == 1)
+
+        # HC vs PD bias initialization
+        total_hc_pd = hc_count + pd_count
+        if total_hc_pd > 0:
+            freq_hc = hc_count / total_hc_pd
+            freq_pd = pd_count / total_hc_pd
+            # Initialize bias to log frequencies (makes initial predictions match class distribution)
+            with torch.no_grad():
+                self.head_hc_vs_pd[-1].bias[0] = np.log(freq_hc + 1e-6)
+                self.head_hc_vs_pd[-1].bias[1] = np.log(freq_pd + 1e-6)
+            print(f"[Bias Init] HC vs PD: HC={freq_hc:.3f} (bias={np.log(freq_hc + 1e-6):.3f}), "
+                  f"PD={freq_pd:.3f} (bias={np.log(freq_pd + 1e-6):.3f})")
+
+        # PD vs DD bias initialization
+        total_pd_dd = pd_count + dd_count
+        if total_pd_dd > 0:
+            freq_pd2 = pd_count / total_pd_dd
+            freq_dd = dd_count / total_pd_dd
+            with torch.no_grad():
+                self.head_pd_vs_dd[-1].bias[0] = np.log(freq_pd2 + 1e-6)
+                self.head_pd_vs_dd[-1].bias[1] = np.log(freq_dd + 1e-6)
+            print(f"[Bias Init] PD vs DD: PD={freq_pd2:.3f} (bias={np.log(freq_pd2 + 1e-6):.3f}), "
+                  f"DD={freq_dd:.3f} (bias={np.log(freq_dd + 1e-6):.3f})")
+
+
     def forward(self, batch):
         """
         Forward pass for hierarchical model.
@@ -1430,6 +1463,13 @@ def train_model(config):
             seq_len=config['seq_len'],
             use_auxiliary_loss=config.get('use_auxiliary_loss', False)
         ).to(device)
+
+        # Initialize classification head biases to counter class imbalance
+        print("\n" + "="*60)
+        print("INITIALIZING CLASSIFIER BIASES")
+        print("="*60)
+        model.initialize_classifier_bias(train_dataset)
+        print("="*60 + "\n")
 
         # Compute class weights for handling imbalance
         # Count labels in training data (now patient-level, not patient-task pairs)
