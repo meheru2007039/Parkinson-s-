@@ -535,29 +535,30 @@ class MyModel(nn.Module):
         self.global_pool = nn.AdaptiveAvgPool1d(1)
 
         # ========== LEVEL 2: Task-Level Processing ==========
-        self.window_positional_encoding = PositionalEncoding(model_dim * 2, max_len=100)  # max 100 windows
+        # After fusion, we have model_dim features per window (not model_dim*2)
+        self.window_positional_encoding = PositionalEncoding(model_dim, max_len=100)  # max 100 windows
 
         self.task_layers = nn.ModuleList([
             nn.ModuleDict({
                 'self_attention': nn.MultiheadAttention(
-                    embed_dim=model_dim * 2,
+                    embed_dim=model_dim,
                     num_heads=num_heads,
                     dropout=dropout,
                     batch_first=True
                 ),
-                'norm': nn.LayerNorm(model_dim * 2),
-                'feed_forward': FeedForward(model_dim * 2, d_ff, dropout)
+                'norm': nn.LayerNorm(model_dim),
+                'feed_forward': FeedForward(model_dim, d_ff, dropout)
             })
             for _ in range(num_task_layers)
         ])
 
         # Task-level pooling (attention mechanism)
         # Note: No bias in attention scoring - bias doesn't affect softmax output
-        self.task_attention_pooling = nn.Linear(model_dim * 2, 1, bias=False)
+        self.task_attention_pooling = nn.Linear(model_dim, 1, bias=False)
 
         # ========== Classification Heads ==========
-        # No text encoder - using only signal features
-        fusion_dim = model_dim * 2
+        # After fusion: using model_dim features (not model_dim*2)
+        fusion_dim = model_dim
 
         self.head_hc_vs_pd = nn.Sequential(
             nn.Linear(fusion_dim, model_dim),
@@ -574,17 +575,17 @@ class MyModel(nn.Module):
         )
 
         # ========== Auxiliary Classification Heads (for vanishing gradient mitigation) ==========
-        # These operate directly on window features, providing shorter gradient path
+        # These operate directly on task features, providing shorter gradient path
         if use_auxiliary_loss:
             self.aux_head_hc_vs_pd = nn.Sequential(
-                nn.Linear(model_dim * 2, model_dim),
+                nn.Linear(model_dim, model_dim),
                 nn.ReLU(),
                 nn.Dropout(dropout),
                 nn.Linear(model_dim, 2)
             )
 
             self.aux_head_pd_vs_dd = nn.Sequential(
-                nn.Linear(model_dim * 2, model_dim),
+                nn.Linear(model_dim, model_dim),
                 nn.ReLU(),
                 nn.Dropout(dropout),
                 nn.Linear(model_dim, 2)
@@ -656,15 +657,15 @@ class MyModel(nn.Module):
         # Apply cross-attention layers between left and right wrist
         for layer in self.window_layers:
             left_encoded, right_encoded = layer(left_encoded, right_encoded)
-        
-        # Global pooling for each window
-        left_pool = self.global_pool(left_encoded.transpose(1, 2)).squeeze(-1)  # (batch*max_tasks*max_windows, model_dim)
-        right_pool = self.global_pool(right_encoded.transpose(1, 2)).squeeze(-1) # (batch*max_tasks*max_windows, model_dim)
 
-        # Concatenate left and right features
-        window_features = torch.cat([left_pool, right_pool], dim=1)  # (batch*max_tasks*max_windows, model_dim*2)
+        # Fuse left and right after cross-attention into single representation
+        # Cross-attention has already exchanged information, now unify them
+        fused_encoded = (left_encoded + right_encoded) / 2  # (batch*max_tasks*max_windows, 256, model_dim)
 
-        # Reshape to (batch, max_tasks, max_windows, model_dim*2)
+        # Global pooling for each window (now pooling fused representation)
+        window_features = self.global_pool(fused_encoded.transpose(1, 2)).squeeze(-1)  # (batch*max_tasks*max_windows, model_dim)
+
+        # Reshape to (batch, max_tasks, max_windows, model_dim)
         window_features = window_features.view(batch_size, max_tasks, max_windows, -1)
 
         # ========== LEVEL 1.5: Aggregate windows within each task ==========
@@ -672,7 +673,7 @@ class MyModel(nn.Module):
         task_features_list = []
 
         for task_idx in range(max_tasks):
-            task_windows = window_features[:, task_idx, :, :]  # (batch, max_windows, model_dim*2)
+            task_windows = window_features[:, task_idx, :, :]  # (batch, max_windows, model_dim)
             task_window_mask = batch['window_masks'][:, task_idx, :]  # (batch, max_windows)
 
             # Shuffle windows within this task to prevent learning from serial order
@@ -695,10 +696,10 @@ class MyModel(nn.Module):
             attention_weights = F.softmax(attention_scores, dim=1)
 
             # Aggregate windows → single task representation
-            task_repr = (task_windows * attention_weights).sum(dim=1)  # (batch, model_dim*2)
+            task_repr = (task_windows * attention_weights).sum(dim=1)  # (batch, model_dim)
             task_features_list.append(task_repr)
 
-        # Stack all task representations: (batch, max_tasks, model_dim*2)
+        # Stack all task representations: (batch, max_tasks, model_dim)
         task_features = torch.stack(task_features_list, dim=1)
 
         # ========== LEVEL 2: Aggregate across tasks per patient ==========
@@ -724,7 +725,7 @@ class MyModel(nn.Module):
             # Pool task features for auxiliary classification (simple average over valid tasks)
             valid_task_mask = batch['task_masks'].float().unsqueeze(-1)  # (batch, max_tasks, 1)
             num_valid_tasks = valid_task_mask.sum(dim=1, keepdim=True).clamp(min=1)
-            task_features_for_aux = (task_features * valid_task_mask).sum(dim=1) / num_valid_tasks.squeeze(-1)  # (batch, model_dim*2)
+            task_features_for_aux = (task_features * valid_task_mask).sum(dim=1) / num_valid_tasks.squeeze(-1)  # (batch, model_dim)
             aux_logits_hc = self.aux_head_hc_vs_pd(task_features_for_aux)
             aux_logits_pd = self.aux_head_pd_vs_dd(task_features_for_aux)
 
@@ -734,7 +735,7 @@ class MyModel(nn.Module):
         attention_weights = F.softmax(attention_scores, dim=1)  # (batch, max_tasks, 1)
 
         # Weighted sum of task features → patient representation
-        patient_representation = (task_features * attention_weights).sum(dim=1)  # (batch, model_dim*2)
+        patient_representation = (task_features * attention_weights).sum(dim=1)  # (batch, model_dim)
 
         # ========== Classification ==========
         # Using patient representation aggregated from all tasks
