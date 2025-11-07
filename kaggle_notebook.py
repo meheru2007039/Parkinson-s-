@@ -46,12 +46,13 @@ def get_config():
 
         'batch_size': 8,  # Actual batch size in memory
         'gradient_accumulation_steps': 8,  # Effective batch size = 8 * 8 = 64
-        'learning_rate': 0.0005,
+        'learning_rate': 0.001,  # Increased from 0.0005 to escape local minimum
         'weight_decay': 0.01,
         'num_epochs': 100,
         'num_workers': 0,
         'max_grad_norm': 1.0,  # Gradient clipping threshold (0 = no clipping)
         'use_auxiliary_loss': False,  # Enable if vanishing gradients detected (adds window-level supervision)
+        'label_smoothing': 0.1,  # Add label smoothing to prevent overconfident predictions
 
         'save_metrics': True,
         'create_plots': True,
@@ -1053,6 +1054,17 @@ def analyze_hierarchical_gradient_flow(model):
         else:
             print("✅ Good gradient flow through hierarchy - no action needed!")
 
+    # Check for zero-gradient bias in pooling (indicates attention collapse)
+    pooling_bias_grad = None
+    for name, grad in pooling_grads:
+        if 'bias' in name and grad < 1e-10:
+            print(f"\n🚨 ATTENTION COLLAPSE DETECTED!")
+            print(f"   {name} has zero gradient - attention weights may be uniform")
+            print(f"   RECOMMENDATIONS:")
+            print(f"   1. Increase learning rate: try 0.001 or 0.002")
+            print(f"   2. Use stronger class weights (already applied)")
+            print(f"   3. Consider using focal loss for severe imbalance")
+
     print("="*80 + "\n")
 
 
@@ -1424,9 +1436,13 @@ def train_model(config):
         print(f"\n[Class Weighting] HC vs PD weights: HC={weight_hc_pd[0]:.3f}, PD={weight_hc_pd[1]:.3f}")
         print(f"[Class Weighting] PD vs DD weights: PD={weight_pd_dd[0]:.3f}, DD={weight_pd_dd[1]:.3f}")
 
-        # Use weighted loss instead of differential sampling
-        criterion_hc = nn.CrossEntropyLoss(weight=weight_hc_pd)
-        criterion_pd = nn.CrossEntropyLoss(weight=weight_pd_dd)
+        # Use weighted loss with label smoothing to prevent majority class collapse
+        label_smoothing = config.get('label_smoothing', 0.0)
+        if label_smoothing > 0:
+            print(f"[Label Smoothing] Using label_smoothing={label_smoothing} to prevent overconfident predictions")
+
+        criterion_hc = nn.CrossEntropyLoss(weight=weight_hc_pd, label_smoothing=label_smoothing)
+        criterion_pd = nn.CrossEntropyLoss(weight=weight_pd_dd, label_smoothing=label_smoothing)
 
         optimizer = torch.optim.AdamW(
             model.parameters(),
