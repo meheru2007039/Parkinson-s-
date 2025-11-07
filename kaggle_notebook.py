@@ -729,8 +729,10 @@ class MyModel(nn.Module):
 
             # Return logits as features for visualization
             # These represent the patient-level representation after aggregating all tasks
+            patient_features = torch.cat([logits_hc, logits_pd], dim=1)  # (batch, 4) - concatenated logits
             return {
-                'patient_features': torch.cat([logits_hc, logits_pd], dim=1),  # (batch, 4) - concatenated logits
+                'patient_features': patient_features,
+                'fused_features': patient_features,  # Backward compatibility
                 'logits_hc_vs_pd': logits_hc,  # (batch, 2)
                 'logits_pd_vs_dd': logits_pd   # (batch, 2)
             }
