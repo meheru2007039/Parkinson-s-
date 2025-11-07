@@ -534,11 +534,9 @@ class MyModel(nn.Module):
             for _ in range(num_task_layers)
         ])
 
-        # Task-level pooling
-        self.task_attention_pooling = nn.Sequential(
-            nn.Linear(model_dim * 2, 1),
-            nn.Softmax(dim=1)
-        )
+        # Task-level pooling (attention mechanism)
+        # Note: No bias in attention scoring - bias doesn't affect softmax output
+        self.task_attention_pooling = nn.Linear(model_dim * 2, 1, bias=False)
 
         # ========== Classification Heads ==========
         # No text encoder - using only signal features
@@ -643,12 +641,15 @@ class MyModel(nn.Module):
             task_features = task_layer['feed_forward'](task_features)
         
         # Attention-based pooling to get task representation
-        attention_weights = self.task_attention_pooling(task_features)  # (batch, max_windows, 1)
-        
-        attention_weights = attention_weights.masked_fill(key_padding_mask.unsqueeze(-1), 0)
-        
-        attention_weights = attention_weights / (attention_weights.sum(dim=1, keepdim=True) + 1e-8)
-        
+        attention_scores = self.task_attention_pooling(task_features)  # (batch, max_windows, 1)
+
+        # Mask BEFORE softmax (set padding positions to -inf so they get weight 0)
+        attention_scores = attention_scores.masked_fill(key_padding_mask.unsqueeze(-1), float('-inf'))
+
+        # Apply softmax to get normalized attention weights
+        attention_weights = F.softmax(attention_scores, dim=1)  # (batch, max_windows, 1)
+
+        # Weighted sum of task features
         task_representation = (task_features * attention_weights).sum(dim=1)  # (batch, model_dim*2)
 
         # ========== Classification ==========
@@ -706,10 +707,10 @@ class MyModel(nn.Module):
             task_features = task_layer['norm'](task_features + attn_output)
             task_features = task_layer['feed_forward'](task_features)
         
-        attention_weights = self.task_attention_pooling(task_features)
-        attention_weights = attention_weights.masked_fill(key_padding_mask.unsqueeze(-1), 0)
-        attention_weights = attention_weights / (attention_weights.sum(dim=1, keepdim=True) + 1e-8)
-        
+        # Fixed attention pooling: mask before softmax, no double normalization
+        attention_scores = self.task_attention_pooling(task_features)
+        attention_scores = attention_scores.masked_fill(key_padding_mask.unsqueeze(-1), float('-inf'))
+        attention_weights = F.softmax(attention_scores, dim=1)
         task_representation = (task_features * attention_weights).sum(dim=1)
 
         return {
