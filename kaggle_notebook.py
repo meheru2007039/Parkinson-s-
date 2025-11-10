@@ -33,19 +33,18 @@ def get_config():
         'num_folds': 5,
 
         'input_dim': 6,
-        'model_dim': 64,
-        'num_heads': 8,
-        'num_layers': 3,
-        'num_window_layers': 4,
-        'num_task_layers': 2,
+        'model_dim': 32,
+        'num_heads': 4,
+        'num_window_layers': 2,
+        'num_task_layers': 1,
         'd_ff': 256,
         'dropout': 0.2,
-        'seq_len': 256,
+        'seq_len': 128,
         'num_classes': 2,
         'use_text': False,
 
-        'batch_size': 8,  # Actual batch size in memory
-        'gradient_accumulation_steps': 8,  # Effective batch size = 8 * 8 = 64
+        'batch_size': 1,  # Actual batch size in memory
+        'gradient_accumulation_steps': 16,  # Effective batch size = 8 * 8 = 64
         'learning_rate': 0.001,  # Increased from 0.0005 to escape local minimum
         'weight_decay': 0.01,
         'num_epochs': 100,
