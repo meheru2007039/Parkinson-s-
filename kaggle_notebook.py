@@ -37,9 +37,9 @@ def get_config():
         'num_heads': 4,
         'num_window_layers': 2,
         'num_task_layers': 1,
-        'd_ff': 256,
+        'd_ff': 128,
         'dropout': 0.2,
-        'seq_len': 128,
+        'seq_len': 256,
         'num_classes': 2,
         'use_text': False,
 
