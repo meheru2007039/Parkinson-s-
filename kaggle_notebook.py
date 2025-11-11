@@ -815,8 +815,76 @@ def calculate_metrics(y_true, y_pred, task_name="", verbose=True):
         
         print("Confusion Matrix:")
         print(cm)
-    
+
     return metrics
+
+def plot_loss(train_losses, val_losses, fold_idx=None, output_dir="plots"):
+    """
+    Plot training and validation loss curves.
+
+    Args:
+        train_losses: List of training losses per epoch
+        val_losses: List of validation losses per epoch
+        fold_idx: Optional fold number for filename
+        output_dir: Directory to save plots
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    epochs = range(1, len(train_losses) + 1)
+
+    plt.figure(figsize=(12, 6))
+
+    # Plot losses
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, train_losses, 'b-', label='Training Loss', linewidth=2, marker='o', markersize=4)
+    plt.plot(epochs, val_losses, 'r-', label='Validation Loss', linewidth=2, marker='s', markersize=4)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.title('Training and Validation Loss', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=10)
+    plt.grid(True, alpha=0.3)
+
+    # Plot loss difference (overfitting indicator)
+    plt.subplot(1, 2, 2)
+    loss_diff = [val - train for train, val in zip(train_losses, val_losses)]
+    plt.plot(epochs, loss_diff, 'g-', label='Val Loss - Train Loss', linewidth=2, marker='d', markersize=4)
+    plt.axhline(y=0, color='k', linestyle='--', alpha=0.5)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss Difference', fontsize=12)
+    plt.title('Overfitting Indicator (Val - Train)', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=10)
+    plt.grid(True, alpha=0.3)
+
+    # Add annotation for best epoch (lowest validation loss)
+    best_epoch = np.argmin(val_losses) + 1
+    best_val_loss = min(val_losses)
+    plt.subplot(1, 2, 1)
+    plt.axvline(x=best_epoch, color='orange', linestyle='--', alpha=0.7, label=f'Best Epoch ({best_epoch})')
+    plt.scatter(best_epoch, best_val_loss, color='red', s=100, zorder=5, marker='*')
+    plt.legend(fontsize=10)
+
+    plt.tight_layout()
+
+    # Save figure
+    fold_suffix = f"_fold{fold_idx}" if fold_idx is not None else ""
+    output_path = os.path.join(output_dir, f"loss_curves{fold_suffix}.png")
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print(f"✓ Loss curves saved: {output_path}")
+    print(f"  Best epoch: {best_epoch} with validation loss: {best_val_loss:.4f}")
+
+    # Also create a detailed loss log
+    log_path = os.path.join(output_dir, f"loss_log{fold_suffix}.csv")
+    with open(log_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Epoch', 'Train Loss', 'Val Loss', 'Loss Difference'])
+        for epoch, (train_loss, val_loss) in enumerate(zip(train_losses, val_losses), 1):
+            writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{val_loss - train_loss:.6f}"])
+
+    print(f"✓ Loss log saved: {log_path}")
+
+    return best_epoch, best_val_loss
 
 def save_fold_metric(fold_idx, fold_suffix, best_epoch, best_val_acc,
                      fold_metrics_hc, fold_metrics_pd):
@@ -1570,6 +1638,10 @@ def train_model(config):
         epoch_metrics_hc = []
         epoch_metrics_pd = []
 
+        # Track losses for plotting
+        train_losses = []
+        val_losses = []
+
         # Training loop
         num_epochs = config['num_epochs']
         for epoch in range(num_epochs):
@@ -1660,6 +1732,10 @@ def train_model(config):
 
             print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Avg Acc: {avg_acc:.4f}")
 
+            # Track losses for plotting
+            train_losses.append(train_loss)
+            val_losses.append(val_loss)
+
             # Store metrics for this epoch
             if val_metrics_hc:
                 epoch_metrics_hc.append({
@@ -1717,6 +1793,10 @@ def train_model(config):
         if config['create_plots']:
             plot_dir = f"plots/fold_{fold_idx+1}"
             os.makedirs(plot_dir, exist_ok=True)
+
+            # Plot loss curves
+            if len(train_losses) > 0 and len(val_losses) > 0:
+                plot_loss(train_losses, val_losses, fold_idx=fold_idx+1, output_dir=plot_dir)
 
             # Plot ROC curves
             if best_metrics_hc and 'labels' in best_metrics_hc:
